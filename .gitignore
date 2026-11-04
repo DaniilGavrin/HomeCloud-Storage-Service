@@ -1,0 +1,9 @@
+.idea/
+.vscode/
+*.exe
+*.test
+*.out
+*.log
+.DS_Store
+config.local.json
+.env

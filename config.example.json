@@ -1,0 +1,10 @@
+{
+  "config_version": 1,
+  "storage_node_id": "",
+  "data_dir": "./data",
+  "http_listen": "127.0.0.1:8092",
+  "backend": {
+    "control_ws_url": "ws://127.0.0.1:8080/ws"
+  },
+  "roots": []
+}

@@ -1,8 +1,10 @@
-name: HC Storage Service Go
+name: HC Storage Service — Test & Build
 on:
   push:
     branches: [main]
   pull_request:
+permissions:
+  contents: read
 jobs:
   go:
     runs-on: ubuntu-24.04
@@ -11,14 +13,29 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Test
+      - name: Full Go test with race detector
         run: go test -race -count=1 ./...
       - name: Vet
         run: go vet ./...
-      - name: Build
+      - name: Build all
         run: go build ./...
-      - name: Cross-build Windows
+      - name: Static Linux amd64 server
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        run: |
+          mkdir -p artifacts
+          go build -trimpath -ldflags='-s -w' -o artifacts/hc-storage-service-linux-amd64 ./cmd/storage-service
+      - name: Windows amd64 server
         env:
           GOOS: windows
           GOARCH: amd64
-        run: go build ./...
+          CGO_ENABLED: '0'
+        run: go build -trimpath -ldflags='-s -w' -o artifacts/hc-storage-service-windows-amd64.exe ./cmd/storage-service
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: hc-storage-service-${{ github.sha }}
+          path: artifacts/*
+          if-no-files-found: error

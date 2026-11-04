@@ -90,3 +90,25 @@ func TestDefaultDenyAndConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestListPageStableCursor(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"z.txt", "a.txt", "b.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c, _ := New([]Root{{ID: "r", Kind: Folder, Path: dir, Permission: Permission{List: true}}})
+	s := Selector{Kind: Folder, ID: "r"}
+	a, e := c.ListPage(s, "", 2, "")
+	if e != nil || a.NextCursor != "2" || len(a.Items) != 2 || a.Items[0].Name != "a.txt" {
+		t.Fatal(a, e)
+	}
+	b, e := c.ListPage(s, "", 2, a.NextCursor)
+	if e != nil || len(b.Items) != 1 || b.Items[0].Name != "z.txt" || b.NextCursor != "" {
+		t.Fatal(b, e)
+	}
+	if _, e := c.ListPage(s, "", 2, "nonsense"); e == nil {
+		t.Fatal("invalid cursor accepted")
+	}
+}

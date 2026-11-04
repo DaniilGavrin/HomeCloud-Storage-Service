@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -17,9 +18,10 @@ type Item struct {
 }
 
 type Result struct {
-	Root  Selector `json:"root"`
-	Path  string   `json:"path"`
-	Items []Item   `json:"items"`
+	Root       Selector `json:"root"`
+	Path       string   `json:"path"`
+	Items      []Item   `json:"items"`
+	NextCursor string   `json:"next_cursor,omitempty"`
 }
 
 func item(base, name string, info os.FileInfo) Item {
@@ -31,46 +33,66 @@ func item(base, name string, info os.FileInfo) Item {
 	return Item{Name: name, Kind: kind, RelativePath: rel, SizeBytes: info.Size(), ModifiedUnixNano: info.ModTime().UnixNano()}
 }
 
+// List is the first page. ListPage supports offset cursors for reasonably
+// sized directories (20k entries). Directory mutations invalidate cursors.
 func (c *Catalog) List(s Selector, path string, limit int) (Result, error) {
+	return c.ListPage(s, path, limit, "")
+}
+func (c *Catalog) ListPage(s Selector, path string, limit int, cursor string) (Result, error) {
 	if limit < 1 || limit > 1000 {
 		return Result{}, fmt.Errorf("INVALID_LIMIT")
+	}
+	offset := 0
+	if cursor != "" {
+		v, err := strconv.Atoi(cursor)
+		if err != nil || v < 0 || v > 20000 {
+			return Result{}, fmt.Errorf("INVALID_CURSOR")
+		}
+		offset = v
 	}
 	location, err := c.Resolve(s, path, false)
 	if err != nil {
 		return Result{}, err
 	}
-	f, err := os.Open(location)
+	entries, err := os.ReadDir(location)
 	if err != nil {
 		return Result{}, err
 	}
-	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		return Result{}, err
+	if len(entries) > 20000 {
+		return Result{}, fmt.Errorf("DIRECTORY_TOO_LARGE")
 	}
-	if !st.IsDir() {
-		return Result{}, fmt.Errorf("NOT_A_DIRECTORY")
-	}
-	entries, err := f.ReadDir(limit + 1)
-	if err != nil {
-		return Result{}, err
-	}
-	if len(entries) > limit {
-		return Result{}, fmt.Errorf("RESULT_LIMIT_EXCEEDED: pagination is not implemented yet")
-	}
-	out := Result{Root: s, Path: path, Items: make([]Item, 0, len(entries))}
+	out := Result{Root: s, Path: path, Items: make([]Item, 0, limit)}
+	// os.ReadDir returns lexical names; only visible regular files/directories
+	// contribute to paging offsets. Symlinks are intentionally excluded.
+	all := make([]Item, 0, len(entries))
 	for _, entry := range entries {
-		// Refuse symlinks in the v0 listing; later descriptor-based APIs can expose them safely.
 		if entry.Type()&os.ModeSymlink != 0 {
 			continue
 		}
-		inf, e := entry.Info()
-		if e != nil || (!inf.IsDir() && !inf.Mode().IsRegular()) {
+		info, err := entry.Info()
+		if err != nil || (!info.IsDir() && !info.Mode().IsRegular()) {
 			continue
 		}
-		out.Items = append(out.Items, item(path, entry.Name(), inf))
+		all = append(all, item(path, entry.Name(), info))
 	}
-	sort.Slice(out.Items, func(i, j int) bool { return strings.ToLower(out.Items[i].Name) < strings.ToLower(out.Items[j].Name) })
+	sort.Slice(all, func(i, j int) bool {
+		a, b := strings.ToLower(all[i].Name), strings.ToLower(all[j].Name)
+		if a == b {
+			return all[i].Name < all[j].Name
+		}
+		return a < b
+	})
+	if offset > len(all) {
+		return Result{}, fmt.Errorf("INVALID_CURSOR")
+	}
+	end := offset + limit
+	if end > len(all) {
+		end = len(all)
+	}
+	out.Items = append(out.Items, all[offset:end]...)
+	if end < len(all) {
+		out.NextCursor = strconv.Itoa(end)
+	}
 	return out, nil
 }
 

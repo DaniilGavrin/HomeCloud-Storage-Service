@@ -4,11 +4,11 @@
 
 Source of truth: [Confluence HC SS Architecture & WS Protocol v1](https://bytewizardru.atlassian.net/wiki/spaces/~6213e5d05d162c0069a4f9e4/pages/5275650). Related epic: [KAN-39](https://bytewizardru.atlassian.net/browse/KAN-39).
 
-## Status (2026-11-04)
+## Status (2026-11-04) — KAN-73 local implementation
 
-**Bootstrap / first implementation, not feature complete.** This first commit implements a working Go binary with local health endpoints, strict config parsing, automatic non-secret persistent node IDs, an in-memory catalog of explicitly published roots and read-only `List/Stat` operations. Roots have explicit `kind: disk|folder` and unique `id`; the same API works for both. No root is published by default.
+**Working:** independently launched Go service; configuration; stable non-secret node ID; read-only disk/folder root catalog; real mounted-volume/physical block-device inventory; page-based list/stat; dedicated outgoing WebSocket control client with RFC6455, standard Backend hello/identified handshake, `storage.agent.register`, inventory updates every 60s, heartbeat every 20s, reconnect and generation fencing. Backend patch is required for new commands. `readyz` reports 200 only while registered with Backend.
 
-**Not implemented yet:** WS control client to Backend, `/ws/source` server, HC SS registration/heartbeat, HCS1 binary frames, actual remote file reads, mutation/upload APIs, volume discovery with free/total bytes, descriptor-based filesystem security, production file IDs and versioning, remote reconnect. The `backend.control_ws_url` config is reserved and **not yet used**. `readyz` returns HTTP 503 with `ws_ready=false` until the real WS control/source functionality is implemented. Do not expose the service as a public file server.
+**Not yet implemented:** `/ws/source` and HCS1 binary data transfer to Media Gateway; durable file IDs; upload/rename/delete; secure descriptor-based filesystem operations under concurrent path replacement; automatic systemd deployment. All shared roots must be explicitly configured locally. No key/token/certificate/password is used to authenticate Storage Service to Backend/Gateway. WebSocket's standard frame masks/handshake nonce are RFC6455 framing details and are not authorization keys.
 
 ## Quick start
 
@@ -61,3 +61,41 @@ The root is **never** auto-enabled just because the disk is visible to Linux. Th
 2. Control WS client: `storage.agent.hello/welcome/heartbeat`, reconnect and snapshot.
 3. Private Source WS: `source.describe`, range read sessions, HCS1 and streaming backpressure.
 4. Hook up the KAN-56 Gateway source resolver with the new `root: {kind,id}` selector.
+
+## KAN-73 — Backend control WS + disk inventory (next stage)
+
+- Automatically discovers mounted volumes (Linux `/proc/self/mountinfo` + `statfs`; Windows logical drive capacities) without granting any file access.
+- Connects to an existing HomeCloudBackend control WebSocket, using the **existing** initial protocol `hello` → `identified`, then `storage.agent.register` → `result`. The Backend companion patch in the KAN-73 archive is **required** for `storage.agent.register`.
+- Registers non-secret `storage_node_id`, persistent across launches. No API keys, tokens or passwords. Periodic `storage.agent.heartbeat` and reconnection. Sends an inventory snapshot for visible disk volumes and locally approved disk/folder roots.
+- Receives Backend `storage.agent.request` events and replies through `storage.agent.reply` to handle `storage.agent.volumes.list`, `storage.agent.roots.list`, `storage.fs.list` (with best-effort cursor pagination), and `storage.fs.stat`. Filesystem operations remain **read-only**, with root selector `{kind:"disk"|"folder",id}` and paths relative to that root.
+- `/readyz` returns 200 **only while the Backend WS is connected and registered**; `/healthz` only asserts that the process is alive.
+
+**Not part of KAN-73:** Source WS/HCS1 binary reads, actual media delivery, file mutation, configurable remote root allowlist updates, secure descriptor-based path operations under concurrent filesystem mutation. The catalog path check is still not a production-grade TOCTOU-resistant reader. Do not expose this agent's control or diagnostics to the public Internet.
+
+### Production config example (adjust IPs and paths)
+
+```json
+{
+  "config_version": 1,
+  "storage_node_id": "",
+  "data_dir": "/var/lib/homecloud-storage",
+  "http_listen": "127.0.0.1:8092",
+  "backend": {"control_ws_url": "ws://100.82.22.45:8080/ws"},
+  "roots": [
+    {"id":"movies","kind":"folder","path":"/mnt/data/Movies","allow_list":true,"allow_read":true,"allow_write":false,"allow_delete":false}
+  ]
+}
+```
+
+The Tailscale/LAN route must be reachable by the storage host. The path shown is an **example**; choose the actual mountpoint after inspecting `findmnt -T <path>` and permissions. A root with `kind=disk` should point to the correct mounted filesystem root. Never publish the system disk just because it was discovered.
+
+### End-to-end smoke after installing both backend and agent patch
+
+```powershell
+cd C:\Users\user\IdeaProjects\HomeCloud-Storage-Service
+go run ./cmd/hcss-smoke -backend ws://127.0.0.1:8080/ws
+# optionally browse your configured folder after reviewing its published root ID:
+go run ./cmd/hcss-smoke -backend ws://127.0.0.1:8080/ws -root-kind folder -root-id movies -path ""
+```
+
+Linux production deployment: see `docs/KAN-73-DEPLOY-UBUNTU.md`. This testing tool only uses the existing (unauthenticated) private Backend control WebSocket.

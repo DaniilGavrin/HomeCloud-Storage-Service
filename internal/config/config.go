@@ -7,6 +7,10 @@ import (
 	"github.com/DaniilGavrin/HomeCloud-Storage-Service/internal/catalog"
 	"os"
 	"strings"
+	"net"
+	"net/netip"
+
+	"github.com/DaniilGavrin/HomeCloud-Storage-Service/internal/sourcews"
 )
 
 type Config struct {
@@ -14,6 +18,10 @@ type Config struct {
 	DataDir       string `json:"data_dir"`
 	StorageNodeID string `json:"storage_node_id"`
 	HTTPListen    string `json:"http_listen"`
+	SourceWS struct {
+		Enabled bool `json:"enabled"`
+		AllowedGatewayIPs []string `json:"allowed_gateway_ips"`
+	} `json:"source_ws"`
 	Backend       struct {
 		ControlWSURL string `json:"control_ws_url"`
 	} `json:"backend"`
@@ -53,6 +61,19 @@ func Load(path string) (Config, error) {
 	}
 	if _, err := catalog.New(cfg.Roots); err != nil {
 		return Config{}, err
+	}
+	if cfg.SourceWS.Enabled {
+		host, _, err := net.SplitHostPort(cfg.HTTPListen)
+		if err != nil { return Config{}, fmt.Errorf("invalid http_listen: %w", err) }
+		addr, err := netip.ParseAddr(host)
+		if err != nil || addr.IsUnspecified() || addr.IsMulticast() ||
+			!(addr.IsPrivate() || addr.IsLoopback() || netip.MustParsePrefix("100.64.0.0/10").Contains(addr.Unmap())) {
+			return Config{}, errors.New("source_ws requires an explicit private listener address")
+		}
+		allowed, err := sourcews.ParsePeerIPs(cfg.SourceWS.AllowedGatewayIPs)
+		if err != nil || len(allowed) == 0 {
+			return Config{}, errors.New("source_ws requires at least one exact private allowed_gateway_ips")
+		}
 	}
 	return cfg, nil
 }

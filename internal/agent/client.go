@@ -19,6 +19,7 @@ import (
 
 	"github.com/DaniilGavrin/HomeCloud-Storage-Service/internal/catalog"
 	"github.com/DaniilGavrin/HomeCloud-Storage-Service/internal/inventory"
+	"github.com/DaniilGavrin/HomeCloud-Storage-Service/internal/sourcews"
 	"github.com/DaniilGavrin/HomeCloud-Storage-Service/internal/wsclient"
 )
 
@@ -281,7 +282,15 @@ func (a *Control) perform(ctx context.Context, action string, data json.RawMessa
 		if arg.Limit == 0 {
 			arg.Limit = 100
 		}
-		return a.Catalog.ListPage(arg.Root, arg.Path, arg.Limit, arg.Cursor)
+		result, err := a.Catalog.ListPage(arg.Root, arg.Path, arg.Limit, arg.Cursor)
+		if err != nil { return nil, err }
+		for i := range result.Items {
+			if result.Items[i].Kind != "file" { continue }
+			if id, e := sourcews.FileID(arg.Root, result.Items[i].RelativePath); e == nil {
+				result.Items[i].FileID = id
+			}
+		}
+		return result, nil
 	case "storage.fs.stat":
 		var arg struct {
 			Root catalog.Selector `json:"root"`
@@ -290,7 +299,14 @@ func (a *Control) perform(ctx context.Context, action string, data json.RawMessa
 		if err := strict(data, &arg); err != nil {
 			return nil, err
 		}
-		return a.Catalog.Stat(arg.Root, arg.Path)
+		item, err := a.Catalog.Stat(arg.Root, arg.Path)
+		if err != nil { return nil, err }
+		if item.Kind == "file" {
+			if id, e := sourcews.FileID(arg.Root, arg.Path); e == nil {
+				item.FileID = id
+			}
+		}
+		return item, nil
 	default:
 		return nil, errors.New("UNKNOWN_AGENT_ACTION")
 	}

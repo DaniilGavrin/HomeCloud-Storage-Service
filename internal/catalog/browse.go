@@ -10,6 +10,7 @@ import (
 )
 
 type Item struct {
+	FileID           string `json:"file_id,omitempty"`
 	Name             string `json:"name"`
 	Kind             string `json:"kind"`
 	RelativePath     string `json:"path"`

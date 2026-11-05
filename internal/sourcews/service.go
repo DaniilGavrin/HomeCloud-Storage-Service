@@ -120,7 +120,7 @@ func (s *Service) open(fileID string) (*os.File, Metadata, error) {
 	if err != nil { return nil, Metadata{}, err }
 	root, err := s.Catalog.Root(ref.Root)
 	if err != nil { return nil, Metadata{}, err }
-	if !root.AllowRead || !root.AllowList { return nil, Metadata{}, catalog.ErrReadDisabled }
+	if !root.Read || !root.List { return nil, Metadata{}, catalog.ErrReadDisabled }
 	// Establish root as an OS-enforced namespace. Unlike Resolve+Open, an
 	// intermediate symlink swap cannot escape this opened root descriptor.
 	anchored, err := os.OpenRoot(root.Path)

@@ -18,6 +18,7 @@ import (
 	"github.com/DaniilGavrin/HomeCloud-Storage-Service/internal/httpserver"
 	"github.com/DaniilGavrin/HomeCloud-Storage-Service/internal/identity"
 	"github.com/DaniilGavrin/HomeCloud-Storage-Service/internal/inventory"
+	"github.com/DaniilGavrin/HomeCloud-Storage-Service/internal/sourcews"
 )
 
 func main() {
@@ -45,7 +46,13 @@ func main() {
 	// Control uses only the existing Backend WS. No passwords, certificates,
 	// API keys or extra user authorisation.
 	go control.Run(ctx)
-	server := &http.Server{Addr: cfg.HTTPListen, Handler: httpserver.Handler(cfg.StorageNodeID, c, control.Ready), ReadHeaderTimeout: 5 * time.Second}
+	var reader *sourcews.Service
+	if cfg.SourceWS.Enabled {
+		peers, err := sourcews.ParsePeerIPs(cfg.SourceWS.AllowedGatewayIPs)
+		if err != nil { slog.Error("source WS peers invalid", "error", err); os.Exit(1) }
+		reader = &sourcews.Service{NodeID: cfg.StorageNodeID, Catalog: c, AllowedPeers: peers}
+	}
+	server := &http.Server{Addr: cfg.HTTPListen, Handler: httpserver.HandlerWithSource(cfg.StorageNodeID, c, reader, control.Ready), ReadHeaderTimeout: 5 * time.Second}
 	defer stop()
 	go func() {
 		<-ctx.Done()

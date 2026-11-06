@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"github.com/DaniilGavrin/HomeCloud-Storage-Service/internal/catalog"
+ "github.com/DaniilGavrin/HomeCloud-Storage-Service/internal/filews"
 	"os"
 	"strings"
 	"net"
 	"net/netip"
+ "path/filepath"
 
 	"github.com/DaniilGavrin/HomeCloud-Storage-Service/internal/sourcews"
 )
@@ -22,7 +24,14 @@ type Config struct {
 		Enabled bool `json:"enabled"`
 		AllowedGatewayIPs []string `json:"allowed_gateway_ips"`
 	} `json:"source_ws"`
-	Backend       struct {
+	FileWS struct {
+    Enabled bool `json:"enabled"`
+    Listen string `json:"listen"`
+    TokenFile string `json:"token_file"`
+    AllowedClientIPs []string `json:"allowed_client_ips"`
+    MaxUploadBytes int64 `json:"max_upload_bytes"`
+  } `json:"file_ws"`
+  Backend       struct {
 		ControlWSURL string `json:"control_ws_url"`
 	} `json:"backend"`
 	Roots []catalog.Root `json:"roots"`
@@ -75,5 +84,17 @@ func Load(path string) (Config, error) {
 			return Config{}, errors.New("source_ws requires at least one exact private allowed_gateway_ips")
 		}
 	}
-	return cfg, nil
+if cfg.FileWS.Enabled {
+  host,port,err:=net.SplitHostPort(cfg.FileWS.Listen)
+  if err!=nil || host==""||port=="" {return Config{},errors.New("FILE_WS_LISTEN_REQUIRED")}
+  addr,err:=netip.ParseAddr(host)
+  tailnet:=netip.MustParsePrefix("100.64.0.0/10")
+  if err!=nil||!addr.Is4()||!(tailnet.Contains(addr)||addr.IsLoopback()) {return Config{},errors.New("FILE_WS_REQUIRES_TAILSCALE_OR_LOOPBACK_BIND")}
+  if _,err:=net.LookupPort("tcp",port);err!=nil {return Config{},errors.New("FILE_WS_INVALID_PORT")}
+  if cfg.FileWS.Listen==cfg.HTTPListen{return Config{},errors.New("FILE_WS_SEPARATE_LISTENER_REQUIRED")}
+  if _,err:=filews.ParseAllowedIPs(cfg.FileWS.AllowedClientIPs);err!=nil{return Config{},err}
+  if cfg.FileWS.MaxUploadBytes<0||cfg.FileWS.MaxUploadBytes>1<<40{return Config{},errors.New("FILE_WS_INVALID_MAX_UPLOAD")}
+  if cfg.FileWS.TokenFile==""{cfg.FileWS.TokenFile=filepath.Join(cfg.DataDir,"filews-token")}
+ }
+ 	return cfg, nil
 }

@@ -67,6 +67,8 @@ func (c *Catalog) ListPage(s Selector, path string, limit int, cursor string) (R
 	// contribute to paging offsets. Symlinks are intentionally excluded.
 	all := make([]Item, 0, len(entries))
 	for _, entry := range entries {
+        // Hide incomplete KAN-81 uploads from browsing and media source IDs.
+        if strings.HasPrefix(entry.Name(), ".hcss-upload-") { continue }
 		if entry.Type()&os.ModeSymlink != 0 {
 			continue
 		}

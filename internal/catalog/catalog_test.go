@@ -112,3 +112,12 @@ func TestListPageStableCursor(t *testing.T) {
 		t.Fatal("invalid cursor accepted")
 	}
 }
+
+func TestTemporaryUploadNeverAppearsInDirectoryInventory(t *testing.T) {
+ dir:=t.TempDir()
+ if err:=os.WriteFile(filepath.Join(dir,".hcss-upload-deadbeef"),[]byte("partial"),0600);err!=nil{t.Fatal(err)}
+ if err:=os.WriteFile(filepath.Join(dir,"real.bin"),[]byte("complete"),0600);err!=nil{t.Fatal(err)}
+ c,err:=New([]Root{{ID:"safe",Kind:Disk,Path:dir,Permission:Permission{List:true,Read:true}}});if err!=nil{t.Fatal(err)}
+ listing,err:=c.List(Selector{Kind:Disk,ID:"safe"},"",100);if err!=nil{t.Fatal(err)}
+ if len(listing.Items)!=1||listing.Items[0].Name!="real.bin"{t.Fatalf("incomplete upload visible: %+v",listing.Items)}
+}

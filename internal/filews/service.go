@@ -1,0 +1,266 @@
+// Package filews provides an opt-in, authenticated, root-confined FILE DATA plane.
+// It is not mounted on Backend's unauthenticated control WebSocket.
+package filews
+
+import (
+ "context"
+ "crypto/rand"
+ "crypto/sha256"
+ "crypto/subtle"
+ "encoding/hex"
+ "encoding/json"
+ "errors"
+ "fmt"
+ "io"
+ "net"
+ "net/http"
+ "net/netip"
+ "os"
+ "path"
+ "strings"
+ "time"
+
+ "github.com/DaniilGavrin/HomeCloud-Storage-Service/internal/catalog"
+ "github.com/coder/websocket"
+)
+
+const ChunkBytes = 128 << 10
+const DefaultMaxUpload = int64(32 << 30)
+
+type Service struct {
+ Catalog *catalog.Catalog
+ TokenSHA256 [32]byte
+ AllowedPeers []netip.Addr
+ MaxUpload int64
+ Slots chan struct{}
+}
+
+type Request struct {
+ V int `json:"v"`
+ ID string `json:"id"`
+ Type string `json:"type"`
+ Root catalog.Selector `json:"root"`
+ Path string `json:"path"`
+ NewPath string `json:"new_path,omitempty"`
+ SizeBytes int64 `json:"size_bytes,omitempty"`
+ SHA256 string `json:"sha256,omitempty"`
+}
+
+// LoadOrCreateToken generates an exclusive 256-bit credential, mode 0600.
+// This secret is never returned through Backend, logs or HC SS inventory.
+func LoadOrCreateToken(filename string) ([32]byte, error) {
+ var empty [32]byte
+ if filename == "" { return empty, errors.New("TRANSFER_TOKEN_PATH_REQUIRED") }
+ if err:=os.MkdirAll(pathDir(filename), 0700);err!=nil{return empty,err}
+ f,err:=os.OpenFile(filename,os.O_CREATE|os.O_EXCL|os.O_WRONLY,0600)
+ if err==nil {
+   var random [32]byte
+   if _,err=rand.Read(random[:]);err!=nil{_ = f.Close(); _=os.Remove(filename);return empty,err}
+   value:=hex.EncodeToString(random[:])+"\n"
+   _,err=io.WriteString(f,value)
+   if err==nil {err=f.Sync()}
+   closeErr:=f.Close()
+   if err==nil {err=closeErr}
+   if err!=nil {_=os.Remove(filename);return empty,err}
+ } else if !os.IsExist(err) {return empty,err}
+ st,err:=os.Lstat(filename)
+ if err!=nil{return empty,err}
+ if !st.Mode().IsRegular() || st.Mode().Perm()&0077 != 0 {return empty,errors.New("TRANSFER_TOKEN_INSECURE_FILE_MODE")}
+ value,err:=os.ReadFile(filename)
+ if err!=nil{return empty,err}
+ raw,err:=hex.DecodeString(strings.TrimSpace(string(value)))
+ if err!=nil || len(raw)!=32 {return empty,errors.New("INVALID_TRANSFER_TOKEN_FILE")}
+ return sha256.Sum256([]byte(hex.EncodeToString(raw))),nil
+}
+
+func pathDir(name string) string {
+ i:=strings.LastIndexAny(name,"/\\")
+ if i<0{return "."}
+ if i==0{return name[:1]}
+ return name[:i]
+}
+
+func ValidPath(p string) bool {
+ if p==""||len(p)>1800||strings.HasPrefix(p,"/")||strings.ContainsAny(p,"\\:\x00")||strings.Contains(p,"//")||strings.HasSuffix(p,"/"){return false}
+ for _,seg:=range strings.Split(p,"/") {
+  if seg==""||seg=="."||seg==".."||strings.HasPrefix(seg,".hcss-upload-"){return false}
+ }
+ return true
+}
+func randomName() (string,error) {
+ var b [16]byte
+ if _,err:=rand.Read(b[:]);err!=nil{return "",err}
+ return ".hcss-upload-"+hex.EncodeToString(b[:]),nil
+}
+func (s *Service) ServeHTTP(w http.ResponseWriter,r *http.Request){
+ if s==nil||s.Catalog==nil||r.Method!=http.MethodGet {http.Error(w,"unavailable",http.StatusServiceUnavailable);return}
+ host,_,err:=net.SplitHostPort(r.RemoteAddr)
+ if err!=nil {http.Error(w,"forbidden",http.StatusForbidden);return}
+ peer,err:=netip.ParseAddr(host)
+ if err!=nil {http.Error(w,"forbidden",http.StatusForbidden);return}
+ authorizedPeer:=false
+ for _,p:=range s.AllowedPeers {if p.Unmap()==peer.Unmap(){authorizedPeer=true;break}}
+ if !authorizedPeer || r.Header.Get("Origin")!="" {http.Error(w,"forbidden",http.StatusForbidden);return}
+ secret:=strings.TrimPrefix(r.Header.Get("Authorization"),"Bearer ")
+ hash:=sha256.Sum256([]byte(secret))
+ if len(secret)!=64||subtle.ConstantTimeCompare(hash[:],s.TokenSHA256[:])!=1 {
+  http.Error(w,"unauthorized",http.StatusUnauthorized);return
+ }
+ if s.Slots!=nil {select{case s.Slots<-struct{}{}:defer func(){<-s.Slots}();default:http.Error(w,"busy",http.StatusTooManyRequests);return}}
+ conn,err:=websocket.Accept(w,r,&websocket.AcceptOptions{InsecureSkipVerify:true})
+ if err!=nil{return}
+ defer conn.CloseNow()
+ conn.SetReadLimit(ChunkBytes+4096)
+ ctx,cancel:=context.WithTimeout(r.Context(),8*time.Hour)
+ defer cancel()
+ typ,b,err:=read(ctx,conn)
+ if err!=nil || typ!=websocket.MessageText {fail(conn,"","INVALID_REQUEST");return}
+ var q Request
+ if json.Unmarshal(b,&q)!=nil||q.V!=1||len(q.ID)<1||len(q.ID)>128||!ValidPath(q.Path) {
+  fail(conn,q.ID,"INVALID_REQUEST");return
+ }
+ root,err:=s.Catalog.Root(q.Root)
+ if err!=nil {fail(conn,q.ID,"ROOT_UNAVAILABLE");return}
+ folder,err:=os.OpenRoot(root.Path)
+ if err!=nil {fail(conn,q.ID,"ROOT_UNAVAILABLE");return}
+ defer folder.Close()
+ var opErr error
+ switch q.Type {
+ case "file.get":
+  if !root.Read {fail(conn,q.ID,"READ_FORBIDDEN");return}
+  opErr=s.download(ctx,conn,folder,q)
+ case "file.put":
+  if !root.Write {fail(conn,q.ID,"WRITE_FORBIDDEN");return}
+  opErr=s.upload(ctx,conn,folder,q)
+ case "file.mkdir":
+  if !root.Write {fail(conn,q.ID,"WRITE_FORBIDDEN");return}
+  opErr=folder.Mkdir(q.Path,0750)
+  if opErr==nil {opErr=write(ctx,conn,map[string]any{"v":1,"type":"file.complete","id":q.ID})}
+ case "file.delete":
+  if !root.Delete {fail(conn,q.ID,"DELETE_FORBIDDEN");return}
+  opErr=s.delete(folder,q.Path)
+  if opErr==nil {opErr=write(ctx,conn,map[string]any{"v":1,"type":"file.complete","id":q.ID})}
+ case "file.rename":
+  if !root.Write||!root.Delete {fail(conn,q.ID,"RENAME_FORBIDDEN");return}
+  if !ValidPath(q.NewPath)||q.NewPath==q.Path {fail(conn,q.ID,"INVALID_PATH");return}
+  opErr=s.rename(folder,q.Path,q.NewPath)
+  if opErr==nil {opErr=write(ctx,conn,map[string]any{"v":1,"type":"file.complete","id":q.ID})}
+ default:
+  fail(conn,q.ID,"UNSUPPORTED_ACTION");return
+ }
+ if opErr!=nil {fail(conn,q.ID,classify(opErr))}
+}
+
+func read(parent context.Context,c *websocket.Conn)(websocket.MessageType,[]byte,error){
+ ctx,cancel:=context.WithTimeout(parent,40*time.Second);defer cancel()
+ return c.Read(ctx)
+}
+func write(parent context.Context,c *websocket.Conn,v any)error{
+ b,err:=json.Marshal(v);if err!=nil{return err}
+ ctx,cancel:=context.WithTimeout(parent,25*time.Second);defer cancel()
+ return c.Write(ctx,websocket.MessageText,b)
+}
+func binary(parent context.Context,c *websocket.Conn,b []byte)error{
+ ctx,cancel:=context.WithTimeout(parent,25*time.Second);defer cancel()
+ return c.Write(ctx,websocket.MessageBinary,b)
+}
+func fail(c *websocket.Conn,id,code string){
+ ctx,cancel:=context.WithTimeout(context.Background(),3*time.Second);defer cancel()
+ _=write(ctx,c,map[string]any{"v":1,"type":"file.error","id":id,"code":code})
+}
+func classify(err error)string{
+ switch {
+ case os.IsExist(err):return "TARGET_EXISTS"
+ case os.IsNotExist(err):return "NOT_FOUND"
+ case os.IsPermission(err):return "PERMISSION_DENIED"
+ case errors.Is(err,io.ErrUnexpectedEOF),errors.Is(err,io.EOF):return "TRANSFER_INTERRUPTED"
+ default:return "FILE_OPERATION_FAILED"
+ }
+}
+func(s *Service)download(ctx context.Context,c *websocket.Conn,root *os.Root,q Request)error{
+ f,err:=root.Open(q.Path);if err!=nil{return err}
+ defer f.Close()
+ st,err:=f.Stat();if err!=nil{return err}
+ if !st.Mode().IsRegular(){return errors.New("not regular")}
+ if err:=write(ctx,c,map[string]any{"v":1,"id":q.ID,"type":"file.ready","size_bytes":st.Size()});err!=nil{return err}
+ h:=sha256.New()
+ buf:=make([]byte,ChunkBytes)
+ var count int64
+ for {
+  if err:=ctx.Err();err!=nil{return err}
+  n,e:=f.Read(buf)
+  if n>0 {
+   h.Write(buf[:n]);count+=int64(n)
+   if err:=binary(ctx,c,buf[:n]);err!=nil{return err}
+  }
+  if e==io.EOF{break}
+  if e!=nil{return e}
+ }
+ if count!=st.Size(){return errors.New("FILE_CHANGED_DURING_DOWNLOAD")}
+ return write(ctx,c,map[string]any{"v":1,"type":"file.complete","id":q.ID,"size_bytes":count,"sha256":hex.EncodeToString(h.Sum(nil))})
+}
+func(s *Service)upload(ctx context.Context,c *websocket.Conn,root *os.Root,q Request)error{
+ max:=s.MaxUpload
+ if max<=0 {max=DefaultMaxUpload}
+ if q.SizeBytes<0||q.SizeBytes>max{return errors.New("UPLOAD_LIMIT_EXCEEDED")}
+ dir,base:=path.Split(q.Path)
+ if base=="" {return errors.New("INVALID_PATH")}
+ tmpName,err:=randomName();if err!=nil{return err}
+ tmp:=dir+tmpName
+ f,err:=root.OpenFile(tmp,os.O_WRONLY|os.O_CREATE|os.O_EXCL,0600)
+ if err!=nil{return err}
+ defer root.Remove(tmp)
+ defer f.Close()
+ if err:=write(ctx,c,map[string]any{"v":1,"type":"file.ready","id":q.ID,"size_bytes":q.SizeBytes});err!=nil{return err}
+ h:=sha256.New()
+ var written int64
+ for {
+  typ,payload,e:=read(ctx,c)
+  if e!=nil{return e}
+  if typ==websocket.MessageBinary {
+   if len(payload)>ChunkBytes || written+int64(len(payload))>q.SizeBytes {return errors.New("INVALID_UPLOAD_SIZE")}
+   if _,e=f.Write(payload);e!=nil{return e}
+   h.Write(payload);written+=int64(len(payload))
+   continue
+  }
+  if typ!=websocket.MessageText{return errors.New("INVALID_TRANSFER_FRAME")}
+  var end struct{V int `json:"v"`;ID string `json:"id"`;Type string `json:"type"`;SHA256 string `json:"sha256"`}
+  if json.Unmarshal(payload,&end)!=nil||end.V!=1||end.ID!=q.ID||end.Type!="file.end" {return errors.New("INVALID_END")}
+  digest:=hex.EncodeToString(h.Sum(nil))
+  if written!=q.SizeBytes||end.SHA256!=digest{return errors.New("CHECKSUM_MISMATCH")}
+  if err:=f.Sync();err!=nil{return err}
+  if err:=f.Close();err!=nil{return err}
+  // Link creates destination ONLY if absent. Never silently overwrite files.
+  if err:=root.Link(tmp,q.Path);err!=nil{return err}
+  if err:=root.Remove(tmp);err!=nil{return err}
+  return write(ctx,c,map[string]any{"v":1,"type":"file.complete","id":q.ID,"size_bytes":written,"sha256":digest})
+ }
+}
+func(s *Service)delete(root *os.Root,p string)error{
+ st,err:=root.Lstat(p);if err!=nil{return err}
+ if !st.Mode().IsRegular() && !st.IsDir(){return errors.New("UNSAFE_ENTRY_TYPE")}
+ // Only empty folders are removable; recursive deletion is intentionally absent.
+ return root.Remove(p)
+}
+func(s *Service)rename(root *os.Root,old,new string)error{
+ st,err:=root.Lstat(old);if err!=nil{return err}
+ if !st.Mode().IsRegular(){return errors.New("ONLY_REGULAR_FILES_SUPPORTED")}
+ if err:=root.Link(old,new);err!=nil{return err}
+ if err:=root.Remove(old);err!=nil {
+  _=root.Remove(new)
+  return err
+ }
+ return nil
+}
+
+func ParseAllowedIPs(raw []string)([]netip.Addr,error){
+ if len(raw)==0{return nil,errors.New("FILE_WS_ALLOWED_CLIENT_IPS_REQUIRED")}
+ peers:=make([]netip.Addr,0,len(raw))
+ tailnet:=netip.MustParsePrefix("100.64.0.0/10")
+ for _,s:=range raw {
+  ip,err:=netip.ParseAddr(s)
+  if err!=nil||!ip.Is4()||!(tailnet.Contains(ip)||ip.IsLoopback()){return nil,fmt.Errorf("FILE_WS_INVALID_CLIENT_IP: %q",s)}
+  peers=append(peers,ip)
+ }
+ return peers,nil
+}

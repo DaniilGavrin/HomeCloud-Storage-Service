@@ -6,6 +6,7 @@ import (
 	"flag"
 	"log/slog"
 	"net/http"
+ "net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"github.com/DaniilGavrin/HomeCloud-Storage-Service/internal/agent"
 	"github.com/DaniilGavrin/HomeCloud-Storage-Service/internal/catalog"
 	"github.com/DaniilGavrin/HomeCloud-Storage-Service/internal/config"
+ "github.com/DaniilGavrin/HomeCloud-Storage-Service/internal/filews"
 	"github.com/DaniilGavrin/HomeCloud-Storage-Service/internal/httpserver"
 	"github.com/DaniilGavrin/HomeCloud-Storage-Service/internal/identity"
 	"github.com/DaniilGavrin/HomeCloud-Storage-Service/internal/inventory"
@@ -53,12 +55,35 @@ func main() {
 		reader = &sourcews.Service{NodeID: cfg.StorageNodeID, Catalog: c, AllowedPeers: peers}
 	}
 	server := &http.Server{Addr: cfg.HTTPListen, Handler: httpserver.HandlerWithSource(cfg.StorageNodeID, c, reader, control.Ready), ReadHeaderTimeout: 5 * time.Second}
-	defer stop()
+	// File data and mutations use a separate opt-in Tailnet-only listener.
+    // The token never traverses Backend WS, source WS, inventory or logs.
+    var fileServer *http.Server
+    if cfg.FileWS.Enabled {
+      peers,err:=filews.ParseAllowedIPs(cfg.FileWS.AllowedClientIPs)
+      if err!=nil{slog.Error("file ws allowed peers invalid", "error",err);os.Exit(1)}
+      key,err:=filews.LoadOrCreateToken(cfg.FileWS.TokenFile)
+      if err!=nil{slog.Error("file ws credential setup failed", "error",err);os.Exit(1)}
+      stream:=&filews.Service{Catalog:c,TokenSHA256:key,AllowedPeers:peers,MaxUpload:cfg.FileWS.MaxUploadBytes,Slots:make(chan struct{},2)}
+      mux:=http.NewServeMux()
+      mux.Handle("GET /ws/files",stream)
+      fileServer=&http.Server{Addr:cfg.FileWS.Listen,Handler:mux,ReadHeaderTimeout:5*time.Second}
+      listener,err:=net.Listen("tcp",cfg.FileWS.Listen)
+      if err!=nil{slog.Error("file ws listener failed", "error",err);os.Exit(1)}
+      go func(){
+        if e:=fileServer.Serve(listener);e!=nil&&!errors.Is(e,http.ErrServerClosed){
+          slog.Error("file ws server failed", "error",e)
+          stop()
+        }
+      }()
+      slog.Info("HC SS file transfer listener enabled", "listen",cfg.FileWS.Listen)
+    }
+  	defer stop()
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = server.Shutdown(shutdownCtx)
+        if fileServer!=nil {_ = fileServer.Shutdown(shutdownCtx)}
 	}()
 	slog.Info("HC Storage Service started", "node_id", cfg.StorageNodeID, "listen", cfg.HTTPListen, "roots", len(cfg.Roots), "backend_ws_url", cfg.Backend.ControlWSURL)
 	err = server.ListenAndServe()

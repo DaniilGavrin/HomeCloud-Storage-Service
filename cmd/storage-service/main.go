@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
  "net"
+ "net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -59,12 +60,17 @@ func main() {
 		reader = &sourcews.Service{NodeID: cfg.StorageNodeID, Catalog: c, AllowedPeers: peers}
 	}
 	server := &http.Server{Addr: cfg.HTTPListen, Handler: httpserver.HandlerWithSource(cfg.StorageNodeID, c, reader, control.Ready), ReadHeaderTimeout: 5 * time.Second}
-	// File data and mutations use a separate opt-in Tailnet-only listener.
-    // The token never traverses Backend WS, source WS, inventory or logs.
+	// File data and mutations use a separate opt-in private-network listener.
+    // Optional token never traverses Backend WS, source WS, inventory or logs.
     var fileServer *http.Server
     if cfg.FileWS.Enabled {
-      peers,err:=filews.ParseAllowedIPs(cfg.FileWS.AllowedClientIPs)
-      if err!=nil{slog.Error("file ws allowed peers invalid", "error",err);os.Exit(1)}
+      // Empty ACL is deliberate only in trusted_network: the private bind
+      // and local filesystem permissions define the LAN trust boundary.
+      var peers []netip.Addr
+      if len(cfg.FileWS.AllowedClientIPs)>0 {
+        peers,err=filews.ParseAllowedIPs(cfg.FileWS.AllowedClientIPs)
+        if err!=nil{slog.Error("file ws allowed peers invalid", "error",err);os.Exit(1)}
+      }
       var key [32]byte
       if cfg.FileWS.AuthMode == "token" {
         key,err=filews.LoadOrCreateToken(cfg.FileWS.TokenFile)

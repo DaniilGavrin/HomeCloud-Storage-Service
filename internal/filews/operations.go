@@ -9,6 +9,7 @@ import (
  "os"
  "path"
  "strings"
+ "time"
 )
 
 // File and folder mutations always stay inside the pinned, administrator-
@@ -62,7 +63,7 @@ func (b *copyBudget) add(size int64)error {
 // Data never passes through Backend or HomeCloudUI. It first creates a
 // private random temporary entry at the destination and only publishes a
 // complete copy; failures/cancellation remove that staging tree.
-func (s *Service) copyEntry(ctx context.Context, root *os.Root, old,new string)error{
+func (s *Service) copyEntry(ctx context.Context, root *os.Root, old,new string,notify func(int64)error)error{
  if strings.HasPrefix(new,old+"/"){return errSelfDestination}
  if err:=ctx.Err();err!=nil{return err}
  src,err:=root.Lstat(old)
@@ -76,7 +77,8 @@ func (s *Service) copyEntry(ctx context.Context, root *os.Root, old,new string)e
  // os.Root methods reject symlinks escaping the configured root.
  // Every child is Lstat'd before use, and symlink entries are rejected.
  budget:=&copyBudget{}
- if err=s.copyRecursive(ctx,root,old,stage,budget);err!=nil{
+ progress:=&copyProgress{notify:notify,last:time.Now(),next:4<<20}
+ if err=s.copyRecursive(ctx,root,old,stage,budget,progress);err!=nil{
   _=root.RemoveAll(stage)
   return err
  }
@@ -92,7 +94,19 @@ func (s *Service) copyEntry(ctx context.Context, root *os.Root, old,new string)e
  return root.Remove(stage)
 }
 
-func (s *Service) copyRecursive(ctx context.Context,root *os.Root,old,new string,b *copyBudget)error{
+// Wire-level progress is advisory; the copy stays inside HC SS.
+type copyProgress struct { copied int64; next int64; last time.Time; notify func(int64)error }
+func (p *copyProgress) advance(n int64)error{
+ if p==nil{return nil}
+ p.copied+=n
+ if p.notify==nil{return nil}
+ if p.copied<p.next&&time.Since(p.last)<3*time.Second{return nil}
+ if err:=p.notify(p.copied);err!=nil{return err}
+ p.last=time.Now();p.next=p.copied+(4<<20)
+ return nil
+}
+
+func (s *Service) copyRecursive(ctx context.Context,root *os.Root,old,new string,b *copyBudget,p *copyProgress)error{
  if err:=ctx.Err();err!=nil{return err}
  st,err:=root.Lstat(old)
  if err!=nil{return err}
@@ -101,19 +115,24 @@ func (s *Service) copyRecursive(ctx context.Context,root *os.Root,old,new string
   if err:=root.Mkdir(new,0700);err!=nil{return err}
   f,err:=root.Open(old)
   if err!=nil{return err}
-  entries,err:=f.ReadDir(-1)
-  closeErr:=f.Close()
-  if err!=nil{return err}
-  if closeErr!=nil{return closeErr}
-  for _,entry:=range entries{
-   if err=ctx.Err();err!=nil{return err}
-   // Block special objects, symlinks and nested staging artifacts.
-   if entry.Type()&os.ModeType!=0 && !entry.IsDir(){return errUnsafeEntry}
-   if strings.HasPrefix(entry.Name(),".hcss-upload-")||strings.HasPrefix(entry.Name(),".hcss-copy-"){
-    return errUnsafeEntry
+  // Never use ReadDir(-1): a hostile or very large directory must not
+  // allocate its entire listing before the entry limit is applied.
+  for {
+   entries,readErr:=f.ReadDir(128)
+   for _,entry:=range entries{
+    if err=ctx.Err();err!=nil{_ = f.Close();return err}
+    // Reject links/special files and private staging artifacts.
+    if entry.Type()&os.ModeType!=0 && !entry.IsDir(){_ = f.Close();return errUnsafeEntry}
+    if strings.HasPrefix(entry.Name(),".hcss-upload-")||strings.HasPrefix(entry.Name(),".hcss-copy-"){
+     _ = f.Close();return errUnsafeEntry
+    }
+    if err=s.copyRecursive(ctx,root,path.Join(old,entry.Name()),path.Join(new,entry.Name()),b,p);err!=nil{_ = f.Close();return err}
+    if err=p.advance(0);err!=nil{_ = f.Close();return err}
    }
-   if err:=s.copyRecursive(ctx,root,path.Join(old,entry.Name()),path.Join(new,entry.Name()),b);err!=nil{return err}
+   if readErr==io.EOF{break}
+   if readErr!=nil{_ = f.Close();return readErr}
   }
+  if err=f.Close();err!=nil{return err}
   d,err:=root.OpenRoot(new);if err!=nil{return err}
   err=d.Chmod(".",0777)
   closeErr=d.Close()
@@ -127,7 +146,7 @@ func (s *Service) copyRecursive(ctx context.Context,root *os.Root,old,new string
  out,err:=root.OpenFile(new,os.O_WRONLY|os.O_CREATE|os.O_EXCL,0600)
  if err!=nil{return err}
  buf:=make([]byte,ChunkBytes)
- n,copyErr:=copyContext(ctx,out,in,buf)
+ n,copyErr:=copyContext(ctx,out,in,buf,p.advance)
  if copyErr==nil&&n!=st.Size(){copyErr=io.ErrUnexpectedEOF}
  if copyErr==nil{copyErr=out.Chmod(0666)}
  if copyErr==nil{copyErr=out.Sync()}
@@ -136,7 +155,7 @@ func (s *Service) copyRecursive(ctx context.Context,root *os.Root,old,new string
  return closeErr
 }
 
-func copyContext(ctx context.Context,w io.Writer,r io.Reader,buf []byte)(int64,error){
+func copyContext(ctx context.Context,w io.Writer,r io.Reader,buf []byte,progress func(int64)error)(int64,error){
  var total int64
  for {
   if err:=ctx.Err();err!=nil{return total,err}
@@ -146,6 +165,7 @@ func copyContext(ctx context.Context,w io.Writer,r io.Reader,buf []byte)(int64,e
    total+=int64(used)
    if e!=nil{return total,e}
    if used!=n{return total,io.ErrShortWrite}
+   if progress!=nil {if e:=progress(int64(used));e!=nil{return total,e}}
   }
   if err==io.EOF{return total,nil}
   if err!=nil{return total,err}

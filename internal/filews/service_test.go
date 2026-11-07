@@ -272,3 +272,27 @@ func TestWebOSCopyPermissionAndRollback(t *testing.T){
  names,err:=os.ReadDir(dir);if err!=nil{t.Fatal(err)}
  for _,e:=range names{if strings.HasPrefix(e.Name(),".hcss-copy-"){t.Fatal("orphan temp",e.Name())}}
 }
+
+func TestWebOSCopyProgressAndLargeFile(t *testing.T) {
+ srv,dir:=setup(t,catalog.Permission{List:true,Read:true,Write:true})
+ payload:=make([]byte,5<<20)
+ for i:=range payload {payload[i]=byte(i)}
+ if err:=os.WriteFile(filepath.Join(dir,"original.bin"),payload,0666);err!=nil{t.Fatal(err)}
+ ws:=dial(t,srv);q:=request("file.copy","original.bin");q["new_path"]="copied.bin"
+ sendText(t,ws,q)
+ var progressSeen bool
+ for {
+  _,m,_:=receive(t,ws)
+  if m["type"]=="file.progress" {
+   progressSeen=true
+   if got,_:=m["completed_bytes"].(float64);got<=0 {t.Fatalf("invalid copy progress: %v",m)}
+   continue
+  }
+  if m["type"]!="file.complete"{t.Fatalf("bad copy result: %v",m)}
+  break
+ }
+ if !progressSeen{t.Fatal("large copy did not report progress")}
+ output,err:=os.ReadFile(filepath.Join(dir,"copied.bin"))
+ if err!=nil||len(output)!=len(payload){t.Fatalf("copy output size: %v",err)}
+ for i:=range payload {if output[i]!=payload[i]{t.Fatalf("copy differs at byte %d",i)}}
+}

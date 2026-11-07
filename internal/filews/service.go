@@ -106,7 +106,9 @@ func (s *Service) ServeHTTP(w http.ResponseWriter,r *http.Request){
   if !root.Read||!root.Write {fail(conn,q.ID,"COPY_FORBIDDEN");return}
   if !ValidPath(q.NewPath)||q.NewPath==q.Path {fail(conn,q.ID,"INVALID_PATH");return}
   s.operations.Lock()
-  opErr=s.copyEntry(ctx,folder,q.Path,q.NewPath)
+  opErr=s.copyEntry(ctx,folder,q.Path,q.NewPath,func(done int64)error {
+   return write(ctx,conn,map[string]any{"v":1,"type":"file.progress","id":q.ID,"completed_bytes":done,"total_bytes":0})
+  })
   s.operations.Unlock()
   if opErr==nil {opErr=write(ctx,conn,map[string]any{"v":1,"type":"file.complete","id":q.ID})}
  case "file.delete":

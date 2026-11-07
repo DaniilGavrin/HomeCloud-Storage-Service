@@ -135,7 +135,7 @@ func (s *Service) copyRecursive(ctx context.Context,root *os.Root,old,new string
   if err=f.Close();err!=nil{return err}
   d,err:=root.OpenRoot(new);if err!=nil{return err}
   err=d.Chmod(".",0777)
-  closeErr=d.Close()
+  closeErr:=d.Close()
   if err==nil{err=closeErr}
   return err
  }

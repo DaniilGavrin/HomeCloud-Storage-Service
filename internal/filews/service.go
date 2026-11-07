@@ -105,11 +105,11 @@ func (s *Service) ServeHTTP(w http.ResponseWriter,r *http.Request){
  case "file.copy":
   if !root.Read||!root.Write {fail(conn,q.ID,"COPY_FORBIDDEN");return}
   if !ValidPath(q.NewPath)||q.NewPath==q.Path {fail(conn,q.ID,"INVALID_PATH");return}
-  s.operations.Lock()
+  // Copy uses a private staging path. Do not hold the global mutation
+  // lock while copying gigabytes: other UI actions must stay responsive.
   opErr=s.copyEntry(ctx,folder,q.Path,q.NewPath,func(done int64)error {
    return write(ctx,conn,map[string]any{"v":1,"type":"file.progress","id":q.ID,"completed_bytes":done,"total_bytes":0})
   })
-  s.operations.Unlock()
   if opErr==nil {opErr=write(ctx,conn,map[string]any{"v":1,"type":"file.complete","id":q.ID})}
  case "file.delete":
   if !root.Delete {fail(conn,q.ID,"DELETE_FORBIDDEN");return}

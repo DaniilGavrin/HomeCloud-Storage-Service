@@ -84,6 +84,10 @@ func (s *Service) copyEntry(ctx context.Context, root *os.Root, old,new string,n
  }
  defer root.RemoveAll(stage)
  if err=ctx.Err();err!=nil{return err}
+ // Only publishing is serialized with mkdir/move/delete/rename. Staging
+ // stays private, so another mutation can complete during a long copy.
+ s.operations.Lock()
+ defer s.operations.Unlock()
  if err=checkDestination(root,new);err!=nil{return err}
  if src.IsDir(){
   return root.Rename(stage,new)

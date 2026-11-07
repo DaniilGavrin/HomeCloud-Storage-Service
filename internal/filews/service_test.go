@@ -296,3 +296,32 @@ func TestWebOSCopyProgressAndLargeFile(t *testing.T) {
  if err!=nil||len(output)!=len(payload){t.Fatalf("copy output size: %v",err)}
  for i:=range payload {if output[i]!=payload[i]{t.Fatalf("copy differs at byte %d",i)}}
 }
+
+func TestWebOSLongCopyDoesNotBlockOtherMutations(t *testing.T) {
+ dir:=t.TempDir()
+ payload:=make([]byte,5<<20)
+ if err:=os.WriteFile(filepath.Join(dir,"big.bin"),payload,0644);err!=nil{t.Fatal(err)}
+ root,err:=os.OpenRoot(dir);if err!=nil{t.Fatal(err)};defer root.Close()
+ service:=&Service{}
+ paused:=make(chan struct{})
+ proceed:=make(chan struct{})
+ completed:=make(chan error,1)
+ ctx,cancel:=context.WithTimeout(context.Background(),10*time.Second)
+ defer cancel()
+ go func(){
+  completed<-service.copyEntry(ctx,root,"big.bin","copy.bin",func(int64)error{
+   select{case <-paused:default:close(paused)}
+   select{case <-proceed:return nil;case <-ctx.Done():return ctx.Err()}
+  })
+ }()
+ select{case <-paused:case <-ctx.Done():t.Fatal("copy did not yield progress")}
+ service.operations.Lock()
+ mutationErr:=service.mkdir(root,"other-dir")
+ service.operations.Unlock()
+ close(proceed)
+ if mutationErr!=nil{t.Fatalf("mkdir blocked or failed during copy: %v",mutationErr)}
+ select{
+ case copyErr:=<-completed:if copyErr!=nil{t.Fatal(copyErr)}
+ case <-ctx.Done():t.Fatal("copy stuck")
+ }
+}

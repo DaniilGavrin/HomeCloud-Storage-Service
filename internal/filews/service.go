@@ -16,6 +16,7 @@ import (
  "os"
  "path"
  "strings"
+ "sync"
  "time"
 
  "github.com/DaniilGavrin/HomeCloud-Storage-Service/internal/catalog"
@@ -33,6 +34,7 @@ type Service struct {
  Catalog *catalog.Catalog
  MaxUpload int64
  Slots chan struct{}
+ operations sync.Mutex
 }
 
 type Request struct {
@@ -49,7 +51,7 @@ type Request struct {
 func ValidPath(p string) bool {
  if p==""||len(p)>1800||strings.HasPrefix(p,"/")||strings.ContainsAny(p,"\\:\x00")||strings.Contains(p,"//")||strings.HasSuffix(p,"/"){return false}
  for _,seg:=range strings.Split(p,"/") {
-  if seg==""||seg=="."||seg==".."||strings.HasPrefix(seg,".hcss-upload-"){return false}
+  if seg==""||seg=="."||seg==".."||(strings.HasPrefix(seg,".hcss-upload-")||strings.HasPrefix(seg,".hcss-copy-")){return false}
  }
  return true
 }
@@ -90,23 +92,46 @@ func (s *Service) ServeHTTP(w http.ResponseWriter,r *http.Request){
   opErr=s.upload(ctx,conn,folder,q)
  case "file.mkdir":
   if !root.Write {fail(conn,q.ID,"WRITE_FORBIDDEN");return}
+  s.operations.Lock()
   opErr=s.mkdir(folder,q.Path)
+  s.operations.Unlock()
+  if opErr==nil {opErr=write(ctx,conn,map[string]any{"v":1,"type":"file.complete","id":q.ID})}
+ case "file.touch":
+  if !root.Write {fail(conn,q.ID,"WRITE_FORBIDDEN");return}
+  s.operations.Lock()
+  opErr=s.touch(folder,q.Path)
+  s.operations.Unlock()
+  if opErr==nil {opErr=write(ctx,conn,map[string]any{"v":1,"type":"file.complete","id":q.ID})}
+ case "file.copy":
+  if !root.Read||!root.Write {fail(conn,q.ID,"COPY_FORBIDDEN");return}
+  if !ValidPath(q.NewPath)||q.NewPath==q.Path {fail(conn,q.ID,"INVALID_PATH");return}
+  // Copy uses a private staging path. Do not hold the global mutation
+  // lock while copying gigabytes: other UI actions must stay responsive.
+  opErr=s.copyEntry(ctx,folder,q.Path,q.NewPath,func(done int64)error {
+   return write(ctx,conn,map[string]any{"v":1,"type":"file.progress","id":q.ID,"completed_bytes":done,"total_bytes":0})
+  })
   if opErr==nil {opErr=write(ctx,conn,map[string]any{"v":1,"type":"file.complete","id":q.ID})}
  case "file.delete":
   if !root.Delete {fail(conn,q.ID,"DELETE_FORBIDDEN");return}
+  s.operations.Lock()
   opErr=s.delete(folder,q.Path)
+  s.operations.Unlock()
   if opErr==nil {opErr=write(ctx,conn,map[string]any{"v":1,"type":"file.complete","id":q.ID})}
  case "file.rename":
   if !root.Write||!root.Delete {fail(conn,q.ID,"RENAME_FORBIDDEN");return}
   if !ValidPath(q.NewPath)||q.NewPath==q.Path {fail(conn,q.ID,"INVALID_PATH");return}
+  s.operations.Lock()
   opErr=s.rename(folder,q.Path,q.NewPath)
+  s.operations.Unlock()
   if opErr==nil {opErr=write(ctx,conn,map[string]any{"v":1,"type":"file.complete","id":q.ID})}
  case "file.move":
   // Moving a regular file is a write operation, even if file.delete is
   // disabled. Never replace an existing destination or leave the root.
   if !root.Write {fail(conn,q.ID,"WRITE_FORBIDDEN");return}
   if !ValidPath(q.NewPath)||q.NewPath==q.Path {fail(conn,q.ID,"INVALID_PATH");return}
-  opErr=s.rename(folder,q.Path,q.NewPath)
+  s.operations.Lock()
+  opErr=s.moveEntry(folder,q.Path,q.NewPath)
+  s.operations.Unlock()
   if opErr==nil {opErr=write(ctx,conn,map[string]any{"v":1,"type":"file.complete","id":q.ID})}
  default:
   fail(conn,q.ID,"UNSUPPORTED_ACTION");return

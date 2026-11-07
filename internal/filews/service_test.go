@@ -204,8 +204,8 @@ func TestMoveRejectsInvalidRequestsAndReadOnlyRoot(t *testing.T) {
  q=request("file.move","directory");q["new_path"]="renamed"
  sendText(t,ws2,q)
  _,response,_=receive(t,ws2)
- if response["type"]!="file.error"{t.Fatalf("directory move should be refused: %v",response)}
- if _,err:=os.Stat(filepath.Join(dest,"directory"));err!=nil{t.Fatal(err)}
+ if response["type"]!="file.complete"{t.Fatalf("directory move rejected: %v",response)}
+ if _,err:=os.Stat(filepath.Join(dest,"renamed"));err!=nil{t.Fatal(err)}
 
  ws3:=dial(t,writable)
  q=request("file.move","directory");q["new_path"]="../escape.txt"

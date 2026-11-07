@@ -150,3 +150,66 @@ func TestUploadChecksumMismatchDoesNotPublishFile(t *testing.T) {
   }
  }
 }
+
+// Moving is a write action and must also work in HC SS roots with deletion
+// disabled. No temporary copies or file bytes traverse Backend or UI.
+func TestMoveFileBetweenDirectoriesWithoutDeletePermission(t *testing.T) {
+ server,dir:=setup(t,catalog.Permission{List:true,Read:true,Write:true,Delete:false})
+ if err:=os.Mkdir(filepath.Join(dir,"source"),0755);err!=nil{t.Fatal(err)}
+ if err:=os.Mkdir(filepath.Join(dir,"Movie"),0755);err!=nil{t.Fatal(err)}
+ old:=filepath.Join(dir,"source","Глянцевый логотип.png")
+ payload:=[]byte("a file moved without copying its content")
+ if err:=os.WriteFile(old,payload,0666);err!=nil{t.Fatal(err)}
+ ws:=dial(t,server)
+ q:=request("file.move","source/Глянцевый логотип.png")
+ q["new_path"]="Movie/Глянцевый логотип.png"
+ sendText(t,ws,q)
+ _,response,_:=receive(t,ws)
+ if response["type"]!="file.complete"{t.Fatalf("move rejected: %v",response)}
+ destination:=filepath.Join(dir,"Movie","Глянцевый логотип.png")
+ got,err:=os.ReadFile(destination)
+ if err!=nil||string(got)!=string(payload){t.Fatalf("wrong moved content: %v",err)}
+ if _,err:=os.Lstat(old);!os.IsNotExist(err){t.Fatalf("original path still exists: %v",err)}
+}
+
+// A target collision must not overwrite or delete either file.
+func TestMoveRejectsExistingDestination(t *testing.T) {
+ server,dir:=setup(t,catalog.Permission{List:true,Read:true,Write:true})
+ if err:=os.Mkdir(filepath.Join(dir,"destination"),0755);err!=nil{t.Fatal(err)}
+ if err:=os.WriteFile(filepath.Join(dir,"a.txt"),[]byte("from"),0600);err!=nil{t.Fatal(err)}
+ if err:=os.WriteFile(filepath.Join(dir,"destination","a.txt"),[]byte("already here"),0600);err!=nil{t.Fatal(err)}
+ ws:=dial(t,server)
+ q:=request("file.move","a.txt");q["new_path"]="destination/a.txt"
+ sendText(t,ws,q)
+ _,response,_:=receive(t,ws)
+ if response["type"]!="file.error"||response["code"]!="TARGET_EXISTS"{t.Fatalf("expected collision: %v",response)}
+ src,err:=os.ReadFile(filepath.Join(dir,"a.txt"));if err!=nil||string(src)!="from"{t.Fatal("source changed",err)}
+ dst,err:=os.ReadFile(filepath.Join(dir,"destination","a.txt"));if err!=nil||string(dst)!="already here"{t.Fatal("destination overwritten",err)}
+}
+
+// Move must not provide a hidden delete permission, move directories, or
+// escape the configured HC SS root through traversal/symlinks.
+func TestMoveRejectsInvalidRequestsAndReadOnlyRoot(t *testing.T) {
+ readonly,dir:=setup(t,catalog.Permission{List:true,Read:true})
+ if err:=os.WriteFile(filepath.Join(dir,"a.txt"),[]byte("x"),0600);err!=nil{t.Fatal(err)}
+ ws:=dial(t,readonly)
+ q:=request("file.move","a.txt");q["new_path"]="new.txt"
+ sendText(t,ws,q)
+ _,response,_:=receive(t,ws)
+ if response["type"]!="file.error"||response["code"]!="WRITE_FORBIDDEN"{t.Fatalf("read-only move accepted: %v",response)}
+
+ writable,dest:=setup(t,catalog.Permission{List:true,Read:true,Write:true})
+ if err:=os.Mkdir(filepath.Join(dest,"directory"),0755);err!=nil{t.Fatal(err)}
+ ws2:=dial(t,writable)
+ q=request("file.move","directory");q["new_path"]="renamed"
+ sendText(t,ws2,q)
+ _,response,_=receive(t,ws2)
+ if response["type"]!="file.error"{t.Fatalf("directory move should be refused: %v",response)}
+ if _,err:=os.Stat(filepath.Join(dest,"directory"));err!=nil{t.Fatal(err)}
+
+ ws3:=dial(t,writable)
+ q=request("file.move","directory");q["new_path"]="../escape.txt"
+ sendText(t,ws3,q)
+ _,response,_=receive(t,ws3)
+ if response["type"]!="file.error"||response["code"]!="INVALID_PATH"{t.Fatalf("unsafe path accepted: %v",response)}
+}

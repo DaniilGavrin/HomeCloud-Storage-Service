@@ -101,6 +101,13 @@ func (s *Service) ServeHTTP(w http.ResponseWriter,r *http.Request){
   if !ValidPath(q.NewPath)||q.NewPath==q.Path {fail(conn,q.ID,"INVALID_PATH");return}
   opErr=s.rename(folder,q.Path,q.NewPath)
   if opErr==nil {opErr=write(ctx,conn,map[string]any{"v":1,"type":"file.complete","id":q.ID})}
+ case "file.move":
+  // Moving a regular file is a write operation, even if file.delete is
+  // disabled. Never replace an existing destination or leave the root.
+  if !root.Write {fail(conn,q.ID,"WRITE_FORBIDDEN");return}
+  if !ValidPath(q.NewPath)||q.NewPath==q.Path {fail(conn,q.ID,"INVALID_PATH");return}
+  opErr=s.rename(folder,q.Path,q.NewPath)
+  if opErr==nil {opErr=write(ctx,conn,map[string]any{"v":1,"type":"file.complete","id":q.ID})}
  default:
   fail(conn,q.ID,"UNSUPPORTED_ACTION");return
  }
@@ -220,6 +227,9 @@ func(s *Service)delete(root *os.Root,p string)error{
  // Only empty folders are removable; recursive deletion is intentionally absent.
  return root.Remove(p)
 }
+// rename performs a no-overwrite, root-confined move of a regular file.
+// Link+unlink preserves file data and modes without downloading it to UI.
+// It works inside one filesystem; EXDEV and other filesystem errors propagate.
 func(s *Service)rename(root *os.Root,old,new string)error{
  st,err:=root.Lstat(old);if err!=nil{return err}
  if !st.Mode().IsRegular(){return errors.New("ONLY_REGULAR_FILES_SUPPORTED")}

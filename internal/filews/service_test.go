@@ -144,7 +144,7 @@ func TestTrustedPrivateNetworkWithoutManualToken(t *testing.T) {
         Permission:catalog.Permission{List:true,Read:true,Write:true,Delete:true}}})
     if err!=nil{t.Fatal(err)}
     trusted:=httptest.NewServer(&Service{Catalog:c,TrustedNetwork:true,
-        AllowedPeers:[]netip.Addr{netip.MustParseAddr("127.0.0.1")},Slots:make(chan struct{},1)})
+        Slots:make(chan struct{},1)})
     defer trusted.Close()
     ctx,cancel:=context.WithTimeout(context.Background(),5*time.Second)
     defer cancel()
@@ -157,6 +157,21 @@ func TestTrustedPrivateNetworkWithoutManualToken(t *testing.T) {
     if _,err:=os.Stat(filepath.Join(dir,"test-folder"));err!=nil{t.Fatal(err)}
     _=server
 }
+func TestTrustedNetworkWithoutACLIsPrivateOnly(t *testing.T) {
+    trusted:=&Service{TrustedNetwork:true}
+    for _,ip:=range []string{"127.0.0.1","192.168.0.123","10.12.0.8","172.18.1.9","100.114.58.74"} {
+        if !trusted.permitsPeer(netip.MustParseAddr(ip)){t.Fatalf("private client rejected: %s",ip)}
+    }
+    for _,ip:=range []string{"8.8.8.8","1.2.3.4","169.254.10.20","::1"} {
+        if trusted.permitsPeer(netip.MustParseAddr(ip)){t.Fatalf("nonprivate client accepted: %s",ip)}
+    }
+    trusted.AllowedPeers=[]netip.Addr{netip.MustParseAddr("192.168.0.123")}
+    if !trusted.permitsPeer(netip.MustParseAddr("192.168.0.123")) || trusted.permitsPeer(netip.MustParseAddr("192.168.0.124")){
+        t.Fatal("optional exact IP restriction is not enforced")
+    }
+    if (&Service{TrustedNetwork:false}).permitsPeer(netip.MustParseAddr("192.168.0.123")) {t.Fatal("token mode without ACL allowed a peer")}
+}
+
 func TestTrustedPeerListAcceptsExactPrivateLANNotInternet(t *testing.T){
     if _,err:=ParseAllowedIPs([]string{"192.168.0.111","10.10.4.3","100.114.58.74"});err!=nil{t.Fatal(err)}
     for _,value:=range []string{"8.8.8.8","0.0.0.0","224.1.2.3","192.168.1.0/24","abc"}{

@@ -6,6 +6,7 @@
   "file_ws": {
     "enabled": false,
     "listen": "",
+    "auth_mode": "trusted_network",
     "allowed_client_ips": [],
     "token_file": "",
     "max_upload_bytes": 0

@@ -93,10 +93,15 @@ if cfg.FileWS.Enabled {
   if err!=nil||!addr.Is4()||!(tailnet.Contains(addr)||addr.IsPrivate()||addr.IsLoopback()) {return Config{},errors.New("FILE_WS_REQUIRES_EXPLICIT_PRIVATE_BIND")}
   if _,err:=net.LookupPort("tcp",port);err!=nil {return Config{},errors.New("FILE_WS_INVALID_PORT")}
   if cfg.FileWS.Listen==cfg.HTTPListen{return Config{},errors.New("FILE_WS_SEPARATE_LISTENER_REQUIRED")}
-  if _,err:=filews.ParseAllowedIPs(cfg.FileWS.AllowedClientIPs);err!=nil{return Config{},err}
   if cfg.FileWS.MaxUploadBytes<0||cfg.FileWS.MaxUploadBytes>1<<40{return Config{},errors.New("FILE_WS_INVALID_MAX_UPLOAD")}
   if cfg.FileWS.AuthMode=="" {cfg.FileWS.AuthMode="token"}
   if cfg.FileWS.AuthMode!="token" && cfg.FileWS.AuthMode!="trusted_network" {return Config{},errors.New("FILE_WS_INVALID_AUTH_MODE")}
+  // Trusted private LAN needs no per-client static IPs. A configured list
+  // still narrows access to those exact addresses.
+  if cfg.FileWS.AuthMode=="token" && len(cfg.FileWS.AllowedClientIPs)==0 {return Config{},errors.New("FILE_WS_ALLOWED_CLIENT_IPS_REQUIRED")}
+  if len(cfg.FileWS.AllowedClientIPs)>0 {
+    if _,err:=filews.ParseAllowedIPs(cfg.FileWS.AllowedClientIPs);err!=nil{return Config{},err}
+  }
   if cfg.FileWS.AuthMode=="token" && cfg.FileWS.TokenFile=="" {cfg.FileWS.TokenFile=filepath.Join(cfg.DataDir,"filews-token")}
  }
  	return cfg, nil

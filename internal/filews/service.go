@@ -1,6 +1,6 @@
 // Package filews provides an opt-in, root-confined FILE DATA plane.
-// Trusted-network mode requires an exact client-IP ACL and a private bind;
-// token mode remains supported for administrators who need both checks.
+// Trusted-network mode requires a private bind and accepts private IPv4 peers.
+// An optional exact client-IP ACL can restrict it further; token mode requires it.
 // No file bytes or destructive operations use Backend's control WebSocket.
 package filews
 
@@ -101,9 +101,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter,r *http.Request){
  if err!=nil {http.Error(w,"forbidden",http.StatusForbidden);return}
  peer,err:=netip.ParseAddr(host)
  if err!=nil {http.Error(w,"forbidden",http.StatusForbidden);return}
- authorizedPeer:=false
- for _,p:=range s.AllowedPeers {if p.Unmap()==peer.Unmap(){authorizedPeer=true;break}}
- if !authorizedPeer || r.Header.Get("Origin")!="" {http.Error(w,"forbidden",http.StatusForbidden);return}
+ if !s.permitsPeer(peer) || r.Header.Get("Origin")!="" {http.Error(w,"forbidden",http.StatusForbidden);return}
  if !s.TrustedNetwork {
   secret:=strings.TrimPrefix(r.Header.Get("Authorization"),"Bearer ")
   hash:=sha256.Sum256([]byte(secret))
@@ -154,6 +152,17 @@ func (s *Service) ServeHTTP(w http.ResponseWriter,r *http.Request){
   fail(conn,q.ID,"UNSUPPORTED_ACTION");return
  }
  if opErr!=nil {fail(conn,q.ID,classify(opErr))}
+}
+
+// permitsPeer never trusts HTTP headers. The exact ACL is optional only for
+// explicitly selected trusted_network mode; publicly routed peers are denied.
+func (s *Service) permitsPeer(peer netip.Addr) bool {
+ peer=peer.Unmap()
+ tailnet:=netip.MustParsePrefix("100.64.0.0/10")
+ if !peer.Is4() || !(peer.IsPrivate() || peer.IsLoopback() || tailnet.Contains(peer)) {return false}
+ if len(s.AllowedPeers)==0 {return s.TrustedNetwork}
+ for _,p:=range s.AllowedPeers {if p.Unmap()==peer{return true}}
+ return false
 }
 
 func read(parent context.Context,c *websocket.Conn)(websocket.MessageType,[]byte,error){

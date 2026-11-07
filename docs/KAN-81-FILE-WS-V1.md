@@ -1,4 +1,6 @@
-# KAN-81 — HC SS authenticated file WebSocket v1
+# KAN-81 — HC SS file WebSocket v1: legacy token-mode reference
+
+> **Current HomeCloudUI workflow:** [trusted private LAN mode](TRUSTED-PRIVATE-FILE-WS.md) requires no manually copied token or individual client-IP list. This file documents the original **token-mode variant** for compatibility, not the only supported channel.
 
 ## Scope
 

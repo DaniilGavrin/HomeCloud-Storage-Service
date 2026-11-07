@@ -25,6 +25,10 @@ import (
 const ChunkBytes = 128 << 10
 const DefaultMaxUpload = int64(32 << 30)
 
+// The receiver reports a stable error code so the native desktop client can
+// retry only integrity failures, not permission or filesystem errors.
+var errChecksumMismatch = errors.New("CHECKSUM_MISMATCH")
+
 type Service struct {
  Catalog *catalog.Catalog
  MaxUpload int64
@@ -86,7 +90,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter,r *http.Request){
   opErr=s.upload(ctx,conn,folder,q)
  case "file.mkdir":
   if !root.Write {fail(conn,q.ID,"WRITE_FORBIDDEN");return}
-  opErr=folder.Mkdir(q.Path,0750)
+  opErr=s.mkdir(folder,q.Path)
   if opErr==nil {opErr=write(ctx,conn,map[string]any{"v":1,"type":"file.complete","id":q.ID})}
  case "file.delete":
   if !root.Delete {fail(conn,q.ID,"DELETE_FORBIDDEN");return}
@@ -122,6 +126,7 @@ func fail(c *websocket.Conn,id,code string){
 }
 func classify(err error)string{
  switch {
+ case errors.Is(err,errChecksumMismatch):return "CHECKSUM_MISMATCH"
  case os.IsExist(err):return "TARGET_EXISTS"
  case os.IsNotExist(err):return "NOT_FOUND"
  case os.IsPermission(err):return "PERMISSION_DENIED"
@@ -148,7 +153,7 @@ func(s *Service)download(ctx context.Context,c *websocket.Conn,root *os.Root,q R
   if e==io.EOF{break}
   if e!=nil{return e}
  }
- if count!=st.Size(){return errors.New("FILE_CHANGED_DURING_DOWNLOAD")}
+ if count!=st.Size(){return errChecksumMismatch}
  return write(ctx,c,map[string]any{"v":1,"type":"file.complete","id":q.ID,"size_bytes":count,"sha256":hex.EncodeToString(h.Sum(nil))})
 }
 func(s *Service)upload(ctx context.Context,c *websocket.Conn,root *os.Root,q Request)error{
@@ -179,7 +184,11 @@ func(s *Service)upload(ctx context.Context,c *websocket.Conn,root *os.Root,q Req
   var end struct{V int `json:"v"`;ID string `json:"id"`;Type string `json:"type"`;SHA256 string `json:"sha256"`}
   if json.Unmarshal(payload,&end)!=nil||end.V!=1||end.ID!=q.ID||end.Type!="file.end" {return errors.New("INVALID_END")}
   digest:=hex.EncodeToString(h.Sum(nil))
-  if written!=q.SizeBytes||end.SHA256!=digest{return errors.New("CHECKSUM_MISMATCH")}
+  if written!=q.SizeBytes||end.SHA256!=digest{return errChecksumMismatch}
+  // Keep the temporary file private during upload. Publish it as world
+  // readable/writable only after checksum verification, before hard-linking.
+  // Explicit Chmod is required because the process umask masks OpenFile modes.
+  if err:=f.Chmod(0o666);err!=nil{return err}
   if err:=f.Sync();err!=nil{return err}
   if err:=f.Close();err!=nil{return err}
   // Link creates destination ONLY if absent. Never silently overwrite files.
@@ -188,6 +197,23 @@ func(s *Service)upload(ctx context.Context,c *websocket.Conn,root *os.Root,q Req
   return write(ctx,c,map[string]any{"v":1,"type":"file.complete","id":q.ID,"size_bytes":written,"sha256":digest})
  }
 }
+// mkdir creates the directory privately, then makes it traversable/writable
+// for local users. An explicit chmod defeats restrictive process umasks.
+// Root.OpenRoot pins the created directory before its permissions are changed.
+func (s *Service) mkdir(root *os.Root, name string) error {
+ if err := root.Mkdir(name, 0o700); err != nil {return err}
+ child, err := root.OpenRoot(name)
+ if err != nil {
+  _ = root.Remove(name)
+  return err
+ }
+ err = child.Chmod(".", 0o777)
+ closeErr := child.Close()
+ if err == nil {err=closeErr}
+ if err != nil {_ = root.Remove(name)}
+ return err
+}
+
 func(s *Service)delete(root *os.Root,p string)error{
  st,err:=root.Lstat(p);if err!=nil{return err}
  if !st.Mode().IsRegular() && !st.IsDir(){return errors.New("UNSAFE_ENTRY_TYPE")}

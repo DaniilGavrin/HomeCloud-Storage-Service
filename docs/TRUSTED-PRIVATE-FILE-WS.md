@@ -1,11 +1,10 @@
-# HC SS file data channel: trusted private network
+# HC SS file data channel — private LAN (KAN-81)
 
-KAN-81 now supports two explicit modes on the **dedicated** file WebSocket listener. Ordinary inventory, browsing and media SourceWS remain unchanged.
+The dedicated `file_ws` listener transfers file data directly between HomeCloudUI and HC Storage Service. Backend WS remains the discovery/browsing control plane; Media Gateway/SourceWS is unchanged.
 
-- `auth_mode: "trusted_network"` (new): No additional manually copied token. Bind only an **explicit private IPv4** and allow only **exact** client IPv4 addresses. The Go service rejects requests from every other source and rejects browser `Origin` headers. Root `allow_read`, `allow_write` and `allow_delete` remain authoritative. Successful agent inventory automatically announces the endpoint to HomeCloudBackend, and HomeCloudUI discovers it from `storage.agent.status`.
-- `auth_mode: "token"` (legacy/optional, default if omitted): Existing 256-bit bearer credential remains supported for users who deliberately want the additional application-layer check. A token-mode endpoint is not advertised to the keyless HomeCloudUI.
+## Keyless trusted private LAN (recommended for isolated home networks)
 
-Example, **modify the existing config rather than replacing it**:
+Edit the `file_ws` field **inside the existing HC SS JSON** (example IP, not the machine's actual address):
 
 ```json
 {
@@ -13,22 +12,34 @@ Example, **modify the existing config rather than replacing it**:
     "enabled": true,
     "auth_mode": "trusted_network",
     "listen": "192.168.0.147:8093",
-    "allowed_client_ips": ["192.168.0.111"],
+    "allowed_client_ips": [],
     "max_upload_bytes": 1073741824
   }
 }
 ```
 
-Replace both addresses with actual server and **trusted desktop** IPv4 values; `192.168.0.111` in this example might be a TV and must not be copied unless it is in fact the permitted desktop. A different approved private LAN or Tailscale IP is supported, but Tailscale is **not mandatory**.
+- No Tailnet, bearer key or static client IP required. `allowed_client_ips: []` permits **any private IPv4 peer able to reach this listener** (RFC1918, loopback or 100.64.0.0/10).
+- Optional `allowed_client_ips: ["192.168.0.25", "192.168.0.26"]` restricts access to exact peers. CIDRs and public IPs are invalid.
+- Bind to an explicit **private local IPv4**, never `0.0.0.0` or a public IP. Host firewall must limit access to the intended private interface/subnet. Do not port-forward port 8093.
+- Root permissions `allow_read`, `allow_write`, `allow_delete` remain enforced by HC SS; relative paths cannot escape configured roots. Browser Origin requests are rejected.
 
-## Threat model
+**Trust boundary:** this is network-trusted, not per-user authenticated. Any reachable private host (including a compromised IoT device) can perform whatever operations the allowed root permits. A private listener alone is insufficient if a reverse proxy/router exposes it. Plain `ws://` does not encrypt traffic against LAN observers. For an untrusted network, isolate the port, use a protected tunnel, or choose the legacy token mode. Tailscale remains optional.
 
-This is **network-trusted, not user-authenticated**. Existing HomeCloudBackend WebSocket `hello` only identifies a client-provided `device_id`; it does not authenticate the human user. It would be unsafe to treat it as permission to delete files. The trusted-network mode intentionally replaces a bearer key with an exact source-IP boundary. Use only on a LAN which you administer, with host firewall/router ACLs preventing untrusted machines from reaching the listener. Plain `ws://` does not provide encryption or integrity against active LAN attackers. Do **not** port-forward 8093, bind `0.0.0.0`, use broad networks, or grant mutation permissions to a whole untrusted storage root.
+## Automatic discovery
 
-Rollback: set `file_ws.enabled=false` and restart HC SS; browsing and media playback on the original listeners still work. For testing use a disposable folder-root, with main disks read-only, then explicitly grant write/delete only after successful tests.
+HC SS advertises the private endpoint in `storage.agent.inventory`; Backend validates it and returns it in `storage.agent.status`; HomeCloudUI discovers the endpoint for the selected node. No key or manual URL is entered in UI. The advertisement is a locator, **not authentication**. An Online HC SS agent does not by itself prove that port 8093 is reachable from the desktop.
 
-## Behavior
+## Token-mode compatibility
 
-HC SS publishes `file_ws:{"endpoint":"ws://PRIVATE_IPV4:8093/ws/files","mode":"trusted_network"}` with each inventory refresh. The Backend validates that it contains no query/credentials and is a private WS endpoint. UI uses exactly the selected agent's URL; users no longer enter a separate address or token. Data bytes do **not** traverse the Backend control WS.
+`auth_mode: "token"` still requires a 256-bit token and at least one exact allowed client IP; omitting `auth_mode` retains the old token-mode default to avoid weakening an existing deployment. HomeCloudUI's keyless automatic discovery does not use token-mode endpoints. [Legacy protocol details](KAN-81-FILE-WS-V1.md).
 
-No authentication is implied by this endpoint advertisement: it is a network locator, not a credential.
+## Acceptance and rollback
+
+1. Back up the live HC SS configuration and storage. Begin with a disposable folder-root; leave the full production disk read-only.
+2. Update and restart HC SS and Backend; check `ss -lntp` and host firewall for the private port. Install the corresponding HomeCloudUI build.
+3. Select Backend → HC SS → allowed root. Verify that operations work without manual Tailnet URL, token, or desktop IP registration.
+4. In the disposable root: mkdir, upload, download with SHA-256 comparison, rename, confirmed delete, no-overwrite rejection, and interrupted-transfer cleanup.
+5. Verify denied root permissions and paths, private-network reachability, and continued SourceWS/TV media playback.
+6. Disable with `file_ws.enabled=false` and restart HC SS to roll back the new data channel without affecting inventory/media.
+
+V1 does **not** yet support resume/range, recursive deletion, or directory rename. Real-device E2E is required before declaring KAN-81 complete.

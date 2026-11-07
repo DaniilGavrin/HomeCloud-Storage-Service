@@ -213,3 +213,62 @@ func TestMoveRejectsInvalidRequestsAndReadOnlyRoot(t *testing.T) {
  _,response,_=receive(t,ws3)
  if response["type"]!="file.error"||response["code"]!="INVALID_PATH"{t.Fatalf("unsafe path accepted: %v",response)}
 }
+
+
+func TestWebOSCopyFilesAndDirectories(t *testing.T) {
+ srv,dir:=setup(t,catalog.Permission{List:true,Read:true,Write:true})
+ if err:=os.MkdirAll(filepath.Join(dir,"a","deep"),0755);err!=nil{t.Fatal(err)}
+ if err:=os.Mkdir(filepath.Join(dir,"other"),0755);err!=nil{t.Fatal(err)}
+ if err:=os.WriteFile(filepath.Join(dir,"a","deep","фильм.mkv"),[]byte("immutable content"),0644);err!=nil{t.Fatal(err)}
+ for _,tc:=range []struct{op,src,dst string}{
+  {"file.copy","a/deep/фильм.mkv","other/фильм.mkv"},
+  {"file.copy","a","a-copy"},
+ }{
+  ws:=dial(t,srv);q:=request(tc.op,tc.src);q["new_path"]=tc.dst
+  sendText(t,ws,q);_,reply,_:=receive(t,ws)
+  if reply["type"]!="file.complete"{t.Fatalf("%s: %v",tc.op,reply)}
+ }
+ for _,p:=range []string{"a/deep/фильм.mkv","other/фильм.mkv","a-copy/deep/фильм.mkv"}{
+  data,err:=os.ReadFile(filepath.Join(dir,filepath.FromSlash(p)));if err!=nil||string(data)!="immutable content"{t.Fatal(p,err)}
+ }
+ // An independent copy has a different inode: editing it never edits source.
+ if err:=os.WriteFile(filepath.Join(dir,"other","фильм.mkv"),[]byte("changed"),0644);err!=nil{t.Fatal(err)}
+ src,_:=os.ReadFile(filepath.Join(dir,"a","deep","фильм.mkv"));if string(src)!="immutable content"{t.Fatal("hard-linked copy")}
+ for _,p:=range []string{"a-copy","a-copy/deep"}{
+  st,err:=os.Stat(filepath.Join(dir,filepath.FromSlash(p)));if err!=nil||st.Mode().Perm()!=0777{t.Fatalf("%s mode: %v %v",p,st,err)}
+ }
+ st,err:=os.Stat(filepath.Join(dir,"a-copy","deep","фильм.mkv"));if err!=nil||st.Mode().Perm()!=0666{t.Fatal("file mode",err)}
+}
+func TestWebOSMoveFoldersAndRejectUnsafeOperations(t *testing.T){
+ srv,dir:=setup(t,catalog.Permission{List:true,Read:true,Write:true})
+ if err:=os.MkdirAll(filepath.Join(dir,"a","inner"),0755);err!=nil{t.Fatal(err)}
+ if err:=os.Mkdir(filepath.Join(dir,"dest"),0755);err!=nil{t.Fatal(err)}
+ if err:=os.WriteFile(filepath.Join(dir,"a","inner","test"),[]byte("ok"),0644);err!=nil{t.Fatal(err)}
+ query:=func(action,old,new string)map[string]any{
+  ws:=dial(t,srv);q:=request(action,old);q["new_path"]=new;sendText(t,ws,q);_,m,_:=receive(t,ws);return m
+ }
+ for _,action:=range []string{"file.copy","file.move"} {
+  if got:=query(action,"a","a/inner/loop");got["type"]!="file.error"{t.Fatal("self destination",action,got)}
+ }
+ if got:=query("file.move","a","dest");got["code"]!="TARGET_EXISTS"{t.Fatalf("overwrite existing dir %v",got)}
+ if got:=query("file.move","a","new-dir");got["type"]!="file.complete"{t.Fatal(got)}
+ if _,err:=os.Stat(filepath.Join(dir,"a"));!os.IsNotExist(err){t.Fatalf("source directory still exists %v",err)}
+ if got,_:=os.ReadFile(filepath.Join(dir,"new-dir","inner","test"));string(got)!="ok"{t.Fatal("lost moved subtree")}
+ if err:=os.Symlink(filepath.Join(dir,"new-dir"),filepath.Join(dir,"alias"));err==nil {
+  if got:=query("file.copy","alias","copy");got["type"]!="file.error"{t.Fatal("copied symlink",got)}
+ }
+ if got:=query("file.touch","empty.txt","");got["type"]!="file.complete"{t.Fatal(got)}
+ if got:=query("file.touch","empty.txt","");got["code"]!="TARGET_EXISTS"{t.Fatal(got)}
+}
+func TestWebOSCopyPermissionAndRollback(t *testing.T){
+ srv,dir:=setup(t,catalog.Permission{List:true,Read:true,Write:true})
+ if err:=os.Mkdir(filepath.Join(dir,"a"),0755);err!=nil{t.Fatal(err)}
+ if err:=os.WriteFile(filepath.Join(dir,"a","src.txt"),[]byte("source"),0644);err!=nil{t.Fatal(err)}
+ if err:=os.Symlink("src.txt",filepath.Join(dir,"a","link"));err!=nil{t.Fatal(err)}
+ ws:=dial(t,srv);q:=request("file.copy","a");q["new_path"]="b"
+ sendText(t,ws,q);_,reply,_:=receive(t,ws)
+ if reply["type"]!="file.error"{t.Fatalf("copied symlink without rejection: %v",reply)}
+ if _,err:=os.Stat(filepath.Join(dir,"b"));!os.IsNotExist(err){t.Fatal("partial published",err)}
+ names,err:=os.ReadDir(dir);if err!=nil{t.Fatal(err)}
+ for _,e:=range names{if strings.HasPrefix(e.Name(),".hcss-copy-"){t.Fatal("orphan temp",e.Name())}}
+}

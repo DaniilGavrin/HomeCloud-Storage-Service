@@ -85,3 +85,68 @@ func TestReadonlyRootsAndPaths(t *testing.T){
  }
  if !ValidPath("Фото/семья/мой файл.mkv"){t.Fatal("unicode path rejected")}
 }
+
+// Files are not executable. Parent directories require x to be traversable.
+// The mode must not depend on the Storage Service's process umask.
+func TestNewUploadAndDirectoryPermissions(t *testing.T) {
+ server, dir := setup(t, catalog.Permission{List:true, Read:true, Write:true, Delete:true})
+ folder := dial(t,server)
+ sendText(t,folder,request("file.mkdir","shared"))
+ _,reply,_:=receive(t,folder)
+ if reply["type"]!="file.complete" {t.Fatal(reply)}
+ directory,err:=os.Stat(filepath.Join(dir,"shared"))
+ if err!=nil {t.Fatal(err)}
+ if got:=directory.Mode().Perm();got!=0o777 {
+  t.Fatalf("new directory mode=%#o, want 0777",got)
+ }
+
+ fileData:=[]byte("file permissions and SHA-256")
+ hash:=sha256.Sum256(fileData)
+ upload:=dial(t,server)
+ q:=request("file.put","shared/test.txt")
+ q["size_bytes"]=len(fileData)
+ sendText(t,upload,q)
+ _,ready,_:=receive(t,upload)
+ if ready["type"]!="file.ready" {t.Fatal(ready)}
+ ctx,cancel:=context.WithTimeout(context.Background(),5*time.Second)
+ if err:=upload.Write(ctx,websocket.MessageBinary,fileData);err!=nil {t.Fatal(err)}
+ cancel()
+ sendText(t,upload,map[string]any{"v":1,"type":"file.end","id":"r1","sha256":hex.EncodeToString(hash[:])})
+ _,done,_:=receive(t,upload)
+ if done["type"]!="file.complete" {t.Fatal(done)}
+ stat,err:=os.Stat(filepath.Join(dir,"shared","test.txt"))
+ if err!=nil {t.Fatal(err)}
+ if got:=stat.Mode().Perm();got!=0o666 {
+  t.Fatalf("new regular file mode=%#o, want 0666 with NO execute bits",got)
+ }
+}
+
+// An incorrect upload hash must be classified as retriable and must never
+// publish the destination file, leaving the client free to retry cleanly.
+func TestUploadChecksumMismatchDoesNotPublishFile(t *testing.T) {
+ server,dir:=setup(t,catalog.Permission{List:true,Read:true,Write:true})
+ ws:=dial(t,server)
+ bytes:=[]byte("integrity test")
+ request:=request("file.put","retry.txt")
+ request["size_bytes"]=len(bytes)
+ sendText(t,ws,request)
+ _,ready,_:=receive(t,ws)
+ if ready["type"]!="file.ready" {t.Fatal(ready)}
+ ctx,cancel:=context.WithTimeout(context.Background(),5*time.Second)
+ if err:=ws.Write(ctx,websocket.MessageBinary,bytes);err!=nil {t.Fatal(err)}
+ cancel()
+ sendText(t,ws,map[string]any{"v":1,"type":"file.end","id":"r1","sha256":strings.Repeat("0",64)})
+ _,result,_:=receive(t,ws)
+ if result["type"]!="file.error" || result["code"]!="CHECKSUM_MISMATCH" {
+  t.Fatalf("expected retryable CHECKSUM_MISMATCH, got %v",result)
+ }
+ if _,err:=os.Stat(filepath.Join(dir,"retry.txt"));!os.IsNotExist(err){
+  t.Fatalf("failed integrity upload published destination: %v",err)
+ }
+ files,err:=os.ReadDir(dir);if err!=nil {t.Fatal(err)}
+ for _,file:=range files {
+  if strings.HasPrefix(file.Name(),".hcss-upload-"){
+    t.Fatalf("orphaned temporary upload: %s",file.Name())
+  }
+ }
+}

@@ -45,6 +45,10 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	control := &agent.Control{URL: cfg.Backend.ControlWSURL, NodeID: cfg.StorageNodeID, Catalog: c, Inspector: inventory.OSInspector{}, Logger: slog.Default()}
+    if cfg.FileWS.Enabled && cfg.FileWS.AuthMode == "trusted_network" {
+      // Publish only the private endpoint; never publish auth credentials.
+      control.FileWSEndpoint = "ws://" + cfg.FileWS.Listen + "/ws/files"
+    }
 	// Control uses only the existing Backend WS. No passwords, certificates,
 	// API keys or extra user authorisation.
 	go control.Run(ctx)
@@ -61,9 +65,12 @@ func main() {
     if cfg.FileWS.Enabled {
       peers,err:=filews.ParseAllowedIPs(cfg.FileWS.AllowedClientIPs)
       if err!=nil{slog.Error("file ws allowed peers invalid", "error",err);os.Exit(1)}
-      key,err:=filews.LoadOrCreateToken(cfg.FileWS.TokenFile)
-      if err!=nil{slog.Error("file ws credential setup failed", "error",err);os.Exit(1)}
-      stream:=&filews.Service{Catalog:c,TokenSHA256:key,AllowedPeers:peers,MaxUpload:cfg.FileWS.MaxUploadBytes,Slots:make(chan struct{},2)}
+      var key [32]byte
+      if cfg.FileWS.AuthMode == "token" {
+        key,err=filews.LoadOrCreateToken(cfg.FileWS.TokenFile)
+        if err!=nil{slog.Error("file ws credential setup failed", "error",err);os.Exit(1)}
+      }
+      stream:=&filews.Service{Catalog:c,TokenSHA256:key,TrustedNetwork:cfg.FileWS.AuthMode=="trusted_network",AllowedPeers:peers,MaxUpload:cfg.FileWS.MaxUploadBytes,Slots:make(chan struct{},2)}
       mux:=http.NewServeMux()
       mux.Handle("GET /ws/files",stream)
       fileServer=&http.Server{Addr:cfg.FileWS.Listen,Handler:mux,ReadHeaderTimeout:5*time.Second}

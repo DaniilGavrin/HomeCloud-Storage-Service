@@ -56,9 +56,10 @@ func next(t *testing.T,c *websocket.Conn)(websocket.MessageType,map[string]any,[
 }
 func req(typ,p string)map[string]any{return map[string]any{"v":1,"id":"r1","type":typ,"path":p,"root":map[string]string{"kind":"folder","id":"safe"}}}
 
-func TestTailnetPeerValidation(t *testing.T){
+func TestPrivatePeerValidation(t *testing.T){
  if _,err:=ParseAllowedIPs(nil);err==nil{t.Fatal("empty ACL allowed")}
- if _,err:=ParseAllowedIPs([]string{"192.168.1.2"});err==nil{t.Fatal("LAN IP allowed")}
+ if _,err:=ParseAllowedIPs([]string{"192.168.1.2"});err!=nil{t.Fatal("private LAN rejected",err)}
+ if _,err:=ParseAllowedIPs([]string{"8.8.8.8"});err==nil{t.Fatal("public IP allowed")}
  if _,err:=ParseAllowedIPs([]string{"100.114.58.74"});err!=nil{t.Fatal(err)}
  if ValidPath("../etc/passwd")||ValidPath("/etc/passwd")||ValidPath("a//b")||ValidPath("a\\b")||ValidPath("folder/.hcss-upload-payload") {t.Fatal("traversal or temp path allowed")}
  if !ValidPath("Фото/семья/мой файл.mkv"){t.Fatal("unicode path not allowed")}
@@ -133,4 +134,32 @@ func TestPeerListNeverTrustsForwardedFor(t *testing.T){
  resp,err:=http.DefaultClient.Do(r);if err!=nil{t.Fatal(err)};resp.Body.Close()
  if resp.StatusCode==http.StatusOK{t.Fatal("plain request upgraded unexpectedly")}
  _,_,_=net.SplitHostPort("127.0.0.1:1")
+}
+
+func TestTrustedPrivateNetworkWithoutManualToken(t *testing.T) {
+    server,dir,_:=testSetup(t,catalog.Permission{List:true,Read:true,Write:true,Delete:true})
+    // The test helper uses the standard token mode; switch to an explicitly
+    // configured trusted-peer handler to exercise the no-token handshake.
+    c,err:=catalog.New([]catalog.Root{{ID:"safe",Kind:catalog.Folder,Path:dir,
+        Permission:catalog.Permission{List:true,Read:true,Write:true,Delete:true}}})
+    if err!=nil{t.Fatal(err)}
+    trusted:=httptest.NewServer(&Service{Catalog:c,TrustedNetwork:true,
+        AllowedPeers:[]netip.Addr{netip.MustParseAddr("127.0.0.1")},Slots:make(chan struct{},1)})
+    defer trusted.Close()
+    ctx,cancel:=context.WithTimeout(context.Background(),5*time.Second)
+    defer cancel()
+    ws,resp,err:=websocket.Dial(ctx,"ws"+strings.TrimPrefix(trusted.URL,"http"),nil)
+    if err!=nil{t.Fatalf("trusted WS refused: %v; status %v",err,resp)}
+    defer ws.CloseNow()
+    textReq(t,ws,req("file.mkdir","test-folder"))
+    _,done,_:=next(t,ws)
+    if done["type"]!="file.complete"{t.Fatalf("file operation denied on exact allowlisted peer: %v",done)}
+    if _,err:=os.Stat(filepath.Join(dir,"test-folder"));err!=nil{t.Fatal(err)}
+    _=server
+}
+func TestTrustedPeerListAcceptsExactPrivateLANNotInternet(t *testing.T){
+    if _,err:=ParseAllowedIPs([]string{"192.168.0.111","10.10.4.3","100.114.58.74"});err!=nil{t.Fatal(err)}
+    for _,value:=range []string{"8.8.8.8","0.0.0.0","224.1.2.3","192.168.1.0/24","abc"}{
+       if _,err:=ParseAllowedIPs([]string{value});err==nil{t.Fatalf("accepted unsafe peer %s",value)}
+    }
 }

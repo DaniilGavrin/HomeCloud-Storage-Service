@@ -27,6 +27,7 @@ type Config struct {
 	FileWS struct {
     Enabled bool `json:"enabled"`
     Listen string `json:"listen"`
+    AuthMode string `json:"auth_mode"` // token (default) or trusted_network
     TokenFile string `json:"token_file"`
     AllowedClientIPs []string `json:"allowed_client_ips"`
     MaxUploadBytes int64 `json:"max_upload_bytes"`
@@ -89,12 +90,14 @@ if cfg.FileWS.Enabled {
   if err!=nil || host==""||port=="" {return Config{},errors.New("FILE_WS_LISTEN_REQUIRED")}
   addr,err:=netip.ParseAddr(host)
   tailnet:=netip.MustParsePrefix("100.64.0.0/10")
-  if err!=nil||!addr.Is4()||!(tailnet.Contains(addr)||addr.IsLoopback()) {return Config{},errors.New("FILE_WS_REQUIRES_TAILSCALE_OR_LOOPBACK_BIND")}
+  if err!=nil||!addr.Is4()||!(tailnet.Contains(addr)||addr.IsPrivate()||addr.IsLoopback()) {return Config{},errors.New("FILE_WS_REQUIRES_EXPLICIT_PRIVATE_BIND")}
   if _,err:=net.LookupPort("tcp",port);err!=nil {return Config{},errors.New("FILE_WS_INVALID_PORT")}
   if cfg.FileWS.Listen==cfg.HTTPListen{return Config{},errors.New("FILE_WS_SEPARATE_LISTENER_REQUIRED")}
   if _,err:=filews.ParseAllowedIPs(cfg.FileWS.AllowedClientIPs);err!=nil{return Config{},err}
   if cfg.FileWS.MaxUploadBytes<0||cfg.FileWS.MaxUploadBytes>1<<40{return Config{},errors.New("FILE_WS_INVALID_MAX_UPLOAD")}
-  if cfg.FileWS.TokenFile==""{cfg.FileWS.TokenFile=filepath.Join(cfg.DataDir,"filews-token")}
+  if cfg.FileWS.AuthMode=="" {cfg.FileWS.AuthMode="token"}
+  if cfg.FileWS.AuthMode!="token" && cfg.FileWS.AuthMode!="trusted_network" {return Config{},errors.New("FILE_WS_INVALID_AUTH_MODE")}
+  if cfg.FileWS.AuthMode=="token" && cfg.FileWS.TokenFile=="" {cfg.FileWS.TokenFile=filepath.Join(cfg.DataDir,"filews-token")}
  }
  	return cfg, nil
 }

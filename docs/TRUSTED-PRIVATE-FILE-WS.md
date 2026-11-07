@@ -1,45 +1,50 @@
-# HC SS file data channel — private LAN (KAN-81)
+# HomeCloud HC SS — automatic file transfer (KAN-81)
 
-The dedicated `file_ws` listener transfers file data directly between HomeCloudUI and HC Storage Service. Backend WS remains the discovery/browsing control plane; Media Gateway/SourceWS is unchanged.
+The HC Storage Service **always** starts its separate WebSocket data plane on
+port **8093**. No `file_ws.enabled`, bind address, token, login, device-IP ACL
+or `auth_mode` is configured. The original JSON keys are silently ignored
+when upgrading an existing installation; they may be removed later.
 
-## Keyless trusted private LAN (recommended for isolated home networks)
+At startup, HC SS discovers assigned **private IPv4** addresses (RFC1918 and
+100.64.0.0/10), binds a listener on each and publishes the successful addresses
+through `storage.agent.inventory.file_ws`. LAN addresses are ordered before
+overlay addresses. Backend validates/forwards the addresses; HomeCloudUI tries
+the available endpoints in order with connection fallback. The metadata-only
+Backend WebSocket stays separate from the file WebSocket.
 
-Edit the `file_ws` field **inside the existing HC SS JSON** (example IP, not the machine's actual address):
+Discovery example (not a fixed installation address):
 
 ```json
-{
-  "file_ws": {
-    "enabled": true,
-    "auth_mode": "trusted_network",
-    "listen": "192.168.0.147:8093",
-    "allowed_client_ips": [],
-    "max_upload_bytes": 1073741824
-  }
-}
+{"file_ws":{
+  "endpoint":"ws://192.168.0.147:8093/ws/files",
+  "endpoints":[
+    "ws://192.168.0.147:8093/ws/files",
+    "ws://100.114.58.74:8093/ws/files"
+  ],
+  "mode":"trusted_network"
+}}
 ```
 
-- No Tailnet, bearer key or static client IP required. `allowed_client_ips: []` permits **any private IPv4 peer able to reach this listener** (RFC1918, loopback or 100.64.0.0/10).
-- Optional `allowed_client_ips: ["192.168.0.25", "192.168.0.26"]` restricts access to exact peers. CIDRs and public IPs are invalid.
-- Bind to an explicit **private local IPv4**, never `0.0.0.0` or a public IP. Host firewall must limit access to the intended private interface/subnet. Do not port-forward port 8093.
-- Root permissions `allow_read`, `allow_write`, `allow_delete` remain enforced by HC SS; relative paths cannot escape configured roots. Browser Origin requests are rejected.
+`endpoint` and `mode` remain only as compatibility fields for older
+HomeCloudUI versions. Neither field changes server access policy.
 
-**Trust boundary:** this is network-trusted, not per-user authenticated. Any reachable private host (including a compromised IoT device) can perform whatever operations the allowed root permits. A private listener alone is insufficient if a reverse proxy/router exposes it. Plain `ws://` does not encrypt traffic against LAN observers. For an untrusted network, isolate the port, use a protected tunnel, or choose the legacy token mode. Tailscale remains optional.
+**Network boundary:** The host firewall, network segmentation and routing
+control which clients can reach port 8093. Do not forward it to the public
+Internet. No end-user authentication is implemented on this channel, and plain
+`ws://` has no transport encryption of its own. Treat every host allowed by
+the firewall as able to exercise the permissions of explicitly published
+storage roots. Protect port 8093 accordingly; use an encrypted tunnel where
+necessary. HC SS still enforces `allow_read`, `allow_write`, `allow_delete`
+and descriptor-rooted path containment.
 
-## Automatic discovery
+`/healthz` and `/readyz` stay on the existing `http_listen` (usually
+127.0.0.1:8092). Source WS / HCS1 to Media Gateway is unchanged.
 
-HC SS advertises the private endpoint in `storage.agent.inventory`; Backend validates it and returns it in `storage.agent.status`; HomeCloudUI discovers the endpoint for the selected node. No key or manual URL is entered in UI. The advertisement is a locator, **not authentication**. An Online HC SS agent does not by itself prove that port 8093 is reachable from the desktop.
+Upgrade order: **Backend → HC SS → HomeCloudUI**. Once updated, restart
+HC SS and verify its logs for "HC SS automatic file transfer enabled",
+`ss -lntp | grep :8093`, and the UI's automatically discovered file channel.
+A private interface must be present when the agent starts to serve remote
+clients. Restart HC SS after changing the machine's network interfaces.
 
-## Token-mode compatibility
-
-`auth_mode: "token"` still requires a 256-bit token and at least one exact allowed client IP; omitting `auth_mode` retains the old token-mode default to avoid weakening an existing deployment. HomeCloudUI's keyless automatic discovery does not use token-mode endpoints. [Legacy protocol details](KAN-81-FILE-WS-V1.md).
-
-## Acceptance and rollback
-
-1. Back up the live HC SS configuration and storage. Begin with a disposable folder-root; leave the full production disk read-only.
-2. Update and restart HC SS and Backend; check `ss -lntp` and host firewall for the private port. Install the corresponding HomeCloudUI build.
-3. Select Backend → HC SS → allowed root. Verify that operations work without manual Tailnet URL, token, or desktop IP registration.
-4. In the disposable root: mkdir, upload, download with SHA-256 comparison, rename, confirmed delete, no-overwrite rejection, and interrupted-transfer cleanup.
-5. Verify denied root permissions and paths, private-network reachability, and continued SourceWS/TV media playback.
-6. Disable with `file_ws.enabled=false` and restart HC SS to roll back the new data channel without affecting inventory/media.
-
-V1 does **not** yet support resume/range, recursive deletion, or directory rename. Real-device E2E is required before declaring KAN-81 complete.
+Rollback: restore the prior binaries and configuration backup together;
+do not delete any storage volumes or directories.

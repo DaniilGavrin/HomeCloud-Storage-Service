@@ -26,7 +26,7 @@ import (
 type Control struct {
 	URL       string
 	NodeID    string
-    FileWSEndpoint string // trusted private-network endpoint; never contains credentials
+	FileWSEndpoints []string // auto-detected private data-plane addresses; never credentials
 	Catalog   *catalog.Catalog
 	Inspector inventory.Inspector
 	Logger    *slog.Logger
@@ -242,8 +242,14 @@ func (a *Control) sendInventory(ctx context.Context, c *wsclient.Conn, epoch uin
 		return err
 	}
 	data := map[string]any{"storage_node_id": a.NodeID, "session_epoch": epoch, "volumes": volumes, "roots": a.Catalog.Published()}
-    if a.FileWSEndpoint != "" {
-       data["file_ws"] = map[string]string{"endpoint":a.FileWSEndpoint, "mode":"trusted_network"}
+    if len(a.FileWSEndpoints) > 0 {
+       // endpoint/mode stay for older desktop clients; endpoints adds LAN/VPN
+       // fallback without requiring network settings or credentials.
+       data["file_ws"] = map[string]any{
+           "endpoint": a.FileWSEndpoints[0],
+           "endpoints": a.FileWSEndpoints,
+           "mode": "trusted_network",
+       }
     }
     packet := map[string]any{"v":1,"type":"command","id":"hc-ss-inventory","action":"storage.agent.inventory","data":data}
 	return send(ctx, c, packet)

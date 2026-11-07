@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/http"
  "net"
- "net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -46,13 +45,6 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	control := &agent.Control{URL: cfg.Backend.ControlWSURL, NodeID: cfg.StorageNodeID, Catalog: c, Inspector: inventory.OSInspector{}, Logger: slog.Default()}
-    if cfg.FileWS.Enabled && cfg.FileWS.AuthMode == "trusted_network" {
-      // Publish only the private endpoint; never publish auth credentials.
-      control.FileWSEndpoint = "ws://" + cfg.FileWS.Listen + "/ws/files"
-    }
-	// Control uses only the existing Backend WS. No passwords, certificates,
-	// API keys or extra user authorisation.
-	go control.Run(ctx)
 	var reader *sourcews.Service
 	if cfg.SourceWS.Enabled {
 		peers, err := sourcews.ParsePeerIPs(cfg.SourceWS.AllowedGatewayIPs)
@@ -60,36 +52,46 @@ func main() {
 		reader = &sourcews.Service{NodeID: cfg.StorageNodeID, Catalog: c, AllowedPeers: peers}
 	}
 	server := &http.Server{Addr: cfg.HTTPListen, Handler: httpserver.HandlerWithSource(cfg.StorageNodeID, c, reader, control.Ready), ReadHeaderTimeout: 5 * time.Second}
-	// File data and mutations use a separate opt-in private-network listener.
-    // Optional token never traverses Backend WS, source WS, inventory or logs.
-    var fileServer *http.Server
-    if cfg.FileWS.Enabled {
-      // Empty ACL is deliberate only in trusted_network: the private bind
-      // and local filesystem permissions define the LAN trust boundary.
-      var peers []netip.Addr
-      if len(cfg.FileWS.AllowedClientIPs)>0 {
-        peers,err=filews.ParseAllowedIPs(cfg.FileWS.AllowedClientIPs)
-        if err!=nil{slog.Error("file ws allowed peers invalid", "error",err);os.Exit(1)}
-      }
-      var key [32]byte
-      if cfg.FileWS.AuthMode == "token" {
-        key,err=filews.LoadOrCreateToken(cfg.FileWS.TokenFile)
-        if err!=nil{slog.Error("file ws credential setup failed", "error",err);os.Exit(1)}
-      }
-      stream:=&filews.Service{Catalog:c,TokenSHA256:key,TrustedNetwork:cfg.FileWS.AuthMode=="trusted_network",AllowedPeers:peers,MaxUpload:cfg.FileWS.MaxUploadBytes,Slots:make(chan struct{},2)}
-      mux:=http.NewServeMux()
-      mux.Handle("GET /ws/files",stream)
-      fileServer=&http.Server{Addr:cfg.FileWS.Listen,Handler:mux,ReadHeaderTimeout:5*time.Second}
-      listener,err:=net.Listen("tcp",cfg.FileWS.Listen)
-      if err!=nil{slog.Error("file ws listener failed", "error",err);os.Exit(1)}
-      go func(){
-        if e:=fileServer.Serve(listener);e!=nil&&!errors.Is(e,http.ErrServerClosed){
-          slog.Error("file ws server failed", "error",e)
-          stop()
-        }
-      }()
-      slog.Info("HC SS file transfer listener enabled", "listen",cfg.FileWS.Listen)
-    }
+	// File transfer is always available on detected private interfaces. The
+	// host firewall controls reachability; filesystem roots control operations.
+	// Obsolete file_ws JSON settings are ignored (no flags, tokens or IP ACLs).
+	privateIPs, err := filews.PrivateListenerIPv4()
+	if err != nil {
+		slog.Error("file transfer interface discovery failed", "error", err)
+		os.Exit(1)
+	}
+	fileServer := &http.Server{ReadHeaderTimeout: 5 * time.Second}
+	stream := &filews.Service{Catalog: c, Slots: make(chan struct{}, 2)}
+	mux := http.NewServeMux()
+	mux.Handle("GET /ws/files", stream)
+	fileServer.Handler = mux
+	var listeners []net.Listener
+	for _, ip := range privateIPs {
+		address := net.JoinHostPort(ip, "8093")
+		listener, listenErr := net.Listen("tcp", address)
+		if listenErr != nil {
+			slog.Warn("file transfer private interface unavailable", "listen", address, "error", listenErr)
+			continue
+		}
+		listeners = append(listeners, listener)
+		control.FileWSEndpoints = append(control.FileWSEndpoints, "ws://"+address+"/ws/files")
+	}
+	if len(listeners) == 0 {
+		slog.Error("no usable private interface for file transfer on port 8093")
+		os.Exit(1)
+	}
+	for _, listener := range listeners {
+		ln := listener
+		go func() {
+			if serveErr := fileServer.Serve(ln); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+				slog.Error("file transfer listener stopped", "address", ln.Addr().String(), "error", serveErr)
+				stop()
+			}
+		}()
+	}
+	slog.Info("HC SS automatic file transfer enabled", "endpoints", control.FileWSEndpoints)
+	// The control connection only carries inventory and metadata, not file data.
+	go control.Run(ctx)
   	defer stop()
 	go func() {
 		<-ctx.Done()

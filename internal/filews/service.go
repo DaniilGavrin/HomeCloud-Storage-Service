@@ -1,22 +1,18 @@
-// Package filews provides an opt-in, root-confined FILE DATA plane.
-// Trusted-network mode requires a private bind and accepts private IPv4 peers.
-// An optional exact client-IP ACL can restrict it further; token mode requires it.
-// No file bytes or destructive operations use Backend's control WebSocket.
+// Package filews provides the root-confined file data plane.
+// Listeners are automatic on private network interfaces; firewall policy
+// governs reachability. No keys or per-client IP lists are used.
+// File bytes never traverse Backend's control WebSocket.
 package filews
 
 import (
  "context"
  "crypto/rand"
  "crypto/sha256"
- "crypto/subtle"
  "encoding/hex"
  "encoding/json"
  "errors"
- "fmt"
  "io"
- "net"
  "net/http"
- "net/netip"
  "os"
  "path"
  "strings"
@@ -31,9 +27,6 @@ const DefaultMaxUpload = int64(32 << 30)
 
 type Service struct {
  Catalog *catalog.Catalog
- TokenSHA256 [32]byte
- AllowedPeers []netip.Addr
- TrustedNetwork bool
  MaxUpload int64
  Slots chan struct{}
 }
@@ -47,40 +40,6 @@ type Request struct {
  NewPath string `json:"new_path,omitempty"`
  SizeBytes int64 `json:"size_bytes,omitempty"`
  SHA256 string `json:"sha256,omitempty"`
-}
-
-// LoadOrCreateToken generates an exclusive 256-bit credential, mode 0600.
-// This secret is never returned through Backend, logs or HC SS inventory.
-func LoadOrCreateToken(filename string) ([32]byte, error) {
- var empty [32]byte
- if filename == "" { return empty, errors.New("TRANSFER_TOKEN_PATH_REQUIRED") }
- if err:=os.MkdirAll(pathDir(filename), 0700);err!=nil{return empty,err}
- f,err:=os.OpenFile(filename,os.O_CREATE|os.O_EXCL|os.O_WRONLY,0600)
- if err==nil {
-   var random [32]byte
-   if _,err=rand.Read(random[:]);err!=nil{_ = f.Close(); _=os.Remove(filename);return empty,err}
-   value:=hex.EncodeToString(random[:])+"\n"
-   _,err=io.WriteString(f,value)
-   if err==nil {err=f.Sync()}
-   closeErr:=f.Close()
-   if err==nil {err=closeErr}
-   if err!=nil {_=os.Remove(filename);return empty,err}
- } else if !os.IsExist(err) {return empty,err}
- st,err:=os.Lstat(filename)
- if err!=nil{return empty,err}
- if !st.Mode().IsRegular() || st.Mode().Perm()&0077 != 0 {return empty,errors.New("TRANSFER_TOKEN_INSECURE_FILE_MODE")}
- value,err:=os.ReadFile(filename)
- if err!=nil{return empty,err}
- raw,err:=hex.DecodeString(strings.TrimSpace(string(value)))
- if err!=nil || len(raw)!=32 {return empty,errors.New("INVALID_TRANSFER_TOKEN_FILE")}
- return sha256.Sum256([]byte(hex.EncodeToString(raw))),nil
-}
-
-func pathDir(name string) string {
- i:=strings.LastIndexAny(name,"/\\")
- if i<0{return "."}
- if i==0{return name[:1]}
- return name[:i]
 }
 
 func ValidPath(p string) bool {
@@ -97,18 +56,8 @@ func randomName() (string,error) {
 }
 func (s *Service) ServeHTTP(w http.ResponseWriter,r *http.Request){
  if s==nil||s.Catalog==nil||r.Method!=http.MethodGet {http.Error(w,"unavailable",http.StatusServiceUnavailable);return}
- host,_,err:=net.SplitHostPort(r.RemoteAddr)
- if err!=nil {http.Error(w,"forbidden",http.StatusForbidden);return}
- peer,err:=netip.ParseAddr(host)
- if err!=nil {http.Error(w,"forbidden",http.StatusForbidden);return}
- if !s.permitsPeer(peer) || r.Header.Get("Origin")!="" {http.Error(w,"forbidden",http.StatusForbidden);return}
- if !s.TrustedNetwork {
-  secret:=strings.TrimPrefix(r.Header.Get("Authorization"),"Bearer ")
-  hash:=sha256.Sum256([]byte(secret))
-  if len(secret)!=64||subtle.ConstantTimeCompare(hash[:],s.TokenSHA256[:])!=1 {
-   http.Error(w,"unauthorized",http.StatusUnauthorized);return
-  }
- }
+ // Reject browser-originated cross-site file mutations. No setup or keys.
+ if r.Header.Get("Origin")!="" {http.Error(w,"forbidden",http.StatusForbidden);return}
  if s.Slots!=nil {select{case s.Slots<-struct{}{}:defer func(){<-s.Slots}();default:http.Error(w,"busy",http.StatusTooManyRequests);return}}
  conn,err:=websocket.Accept(w,r,&websocket.AcceptOptions{InsecureSkipVerify:true})
  if err!=nil{return}
@@ -152,17 +101,6 @@ func (s *Service) ServeHTTP(w http.ResponseWriter,r *http.Request){
   fail(conn,q.ID,"UNSUPPORTED_ACTION");return
  }
  if opErr!=nil {fail(conn,q.ID,classify(opErr))}
-}
-
-// permitsPeer never trusts HTTP headers. The exact ACL is optional only for
-// explicitly selected trusted_network mode; publicly routed peers are denied.
-func (s *Service) permitsPeer(peer netip.Addr) bool {
- peer=peer.Unmap()
- tailnet:=netip.MustParsePrefix("100.64.0.0/10")
- if !peer.Is4() || !(peer.IsPrivate() || peer.IsLoopback() || tailnet.Contains(peer)) {return false}
- if len(s.AllowedPeers)==0 {return s.TrustedNetwork}
- for _,p:=range s.AllowedPeers {if p.Unmap()==peer{return true}}
- return false
 }
 
 func read(parent context.Context,c *websocket.Conn)(websocket.MessageType,[]byte,error){
@@ -265,16 +203,4 @@ func(s *Service)rename(root *os.Root,old,new string)error{
   return err
  }
  return nil
-}
-
-func ParseAllowedIPs(raw []string)([]netip.Addr,error){
- if len(raw)==0{return nil,errors.New("FILE_WS_ALLOWED_CLIENT_IPS_REQUIRED")}
- peers:=make([]netip.Addr,0,len(raw))
- tailnet:=netip.MustParsePrefix("100.64.0.0/10")
- for _,s:=range raw {
-  ip,err:=netip.ParseAddr(s)
-  if err!=nil||!ip.Is4()||!(tailnet.Contains(ip)||ip.IsPrivate()||ip.IsLoopback()){return nil,fmt.Errorf("FILE_WS_INVALID_CLIENT_IP: %q",s)}
-  peers=append(peers,ip)
- }
- return peers,nil
 }

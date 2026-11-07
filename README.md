@@ -4,11 +4,19 @@
 
 Source of truth: [Confluence HC SS Architecture & WS Protocol v1](https://bytewizardru.atlassian.net/wiki/spaces/~6213e5d05d162c0069a4f9e4/pages/5275650). Related epic: [KAN-39](https://bytewizardru.atlassian.net/browse/KAN-39).
 
+## Automatic file transfer (KAN-81)
+
+File WebSocket listens on port 8093 on detected private LAN/overlay interfaces.
+No `file_ws` configuration, key, client allowlist, or auth mode is required.
+Network access is controlled by the host firewall; each published root still
+controls read/write/delete permissions. See
+[automatic file transfer](docs/TRUSTED-PRIVATE-FILE-WS.md).
+
 ## Status (2026-11-04) — KAN-73 local implementation
 
 **Working:** independently launched Go service; configuration; stable non-secret node ID; read-only disk/folder root catalog; real mounted-volume/physical block-device inventory; page-based list/stat; dedicated outgoing WebSocket control client with RFC6455, standard Backend hello/identified handshake, `storage.agent.register`, inventory updates every 60s, heartbeat every 20s, reconnect and generation fencing. Backend patch is required for new commands. `readyz` reports 200 only while registered with Backend.
 
-**Not yet implemented:** `/ws/source` and HCS1 binary data transfer to Media Gateway; durable file IDs; upload/rename/delete; secure descriptor-based filesystem operations under concurrent path replacement; automatic systemd deployment. All shared roots must be explicitly configured locally. No key/token/certificate/password is used to authenticate Storage Service to Backend/Gateway. WebSocket's standard frame masks/handshake nonce are RFC6455 framing details and are not authorization keys.
+**Not yet implemented as of KAN-73:** `/ws/source` and HCS1 binary data transfer to Media Gateway; durable file IDs; upload/rename/delete; secure descriptor-based filesystem operations under concurrent path replacement; automatic systemd deployment. All shared roots must be explicitly configured locally. No key/token/certificate/password is used to authenticate Storage Service to Backend/Gateway. WebSocket's standard frame masks/handshake nonce are RFC6455 framing details and are not authorization keys.
 
 ## Quick start
 

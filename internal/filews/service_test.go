@@ -56,9 +56,10 @@ func next(t *testing.T,c *websocket.Conn)(websocket.MessageType,map[string]any,[
 }
 func req(typ,p string)map[string]any{return map[string]any{"v":1,"id":"r1","type":typ,"path":p,"root":map[string]string{"kind":"folder","id":"safe"}}}
 
-func TestTailnetPeerValidation(t *testing.T){
+func TestPrivatePeerValidation(t *testing.T){
  if _,err:=ParseAllowedIPs(nil);err==nil{t.Fatal("empty ACL allowed")}
- if _,err:=ParseAllowedIPs([]string{"192.168.1.2"});err==nil{t.Fatal("LAN IP allowed")}
+ if _,err:=ParseAllowedIPs([]string{"192.168.1.2"});err!=nil{t.Fatal("private LAN rejected",err)}
+ if _,err:=ParseAllowedIPs([]string{"8.8.8.8"});err==nil{t.Fatal("public IP allowed")}
  if _,err:=ParseAllowedIPs([]string{"100.114.58.74"});err!=nil{t.Fatal(err)}
  if ValidPath("../etc/passwd")||ValidPath("/etc/passwd")||ValidPath("a//b")||ValidPath("a\\b")||ValidPath("folder/.hcss-upload-payload") {t.Fatal("traversal or temp path allowed")}
  if !ValidPath("Фото/семья/мой файл.mkv"){t.Fatal("unicode path not allowed")}

@@ -3,14 +3,6 @@
   "storage_node_id": "",
   "data_dir": "./data",
   "http_listen": "127.0.0.1:8092",
-  "file_ws": {
-    "enabled": false,
-    "listen": "",
-    "auth_mode": "trusted_network",
-    "allowed_client_ips": [],
-    "token_file": "",
-    "max_upload_bytes": 0
-  },
   "source_ws": {
     "enabled": false,
     "allowed_gateway_ips": []

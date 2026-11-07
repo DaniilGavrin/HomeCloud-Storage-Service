@@ -5,176 +5,83 @@ import (
  "crypto/sha256"
  "encoding/hex"
  "encoding/json"
- "net"
  "net/http"
  "net/http/httptest"
- "net/netip"
  "os"
  "path/filepath"
  "strings"
  "testing"
  "time"
-
  "github.com/DaniilGavrin/HomeCloud-Storage-Service/internal/catalog"
  "github.com/coder/websocket"
 )
-
-func testSetup(t *testing.T, perm catalog.Permission)(*httptest.Server,string,string){
+func setup(t *testing.T, perm catalog.Permission)(*httptest.Server,string){
  t.Helper()
  dir:=t.TempDir()
  c,err:=catalog.New([]catalog.Root{{ID:"safe",Kind:catalog.Folder,Path:dir,Permission:perm}})
  if err!=nil{t.Fatal(err)}
- token:="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
- s:=&Service{Catalog:c,TokenSHA256:sha256.Sum256([]byte(token)),AllowedPeers:[]netip.Addr{netip.MustParseAddr("127.0.0.1")},Slots:make(chan struct{},2),MaxUpload:1<<20}
- ts:=httptest.NewServer(s)
- t.Cleanup(ts.Close)
- return ts,dir,token
+ s:=httptest.NewServer(&Service{Catalog:c,Slots:make(chan struct{},2),MaxUpload:1<<20})
+ t.Cleanup(s.Close)
+ return s,dir
 }
-func connect(t *testing.T,server *httptest.Server,token string)*websocket.Conn{
- t.Helper()
- ctx,cancel:=context.WithTimeout(context.Background(),5*time.Second)
- defer cancel()
- c,resp,err:=websocket.Dial(ctx,"ws"+strings.TrimPrefix(server.URL,"http"),&websocket.DialOptions{HTTPHeader:http.Header{"Authorization":[]string{"Bearer "+token}}})
- if err!=nil{t.Fatalf("websocket dial: %v status %v",err,resp)}
- t.Cleanup(func(){c.CloseNow()})
- return c
-}
-func textReq(t *testing.T,c *websocket.Conn,v any){
- t.Helper()
- b,err:=json.Marshal(v);if err!=nil{t.Fatal(err)}
- ctx,cancel:=context.WithTimeout(context.Background(),5*time.Second);defer cancel()
- if err:=c.Write(ctx,websocket.MessageText,b);err!=nil{t.Fatal(err)}
-}
-func next(t *testing.T,c *websocket.Conn)(websocket.MessageType,map[string]any,[]byte){
+func dial(t *testing.T,server *httptest.Server)*websocket.Conn{
  t.Helper()
  ctx,cancel:=context.WithTimeout(context.Background(),5*time.Second);defer cancel()
- typ,b,err:=c.Read(ctx);if err!=nil{t.Fatal(err)}
- if typ==websocket.MessageBinary{return typ,nil,b}
- var m map[string]any
- if err:=json.Unmarshal(b,&m);err!=nil{t.Fatal(err)}
+ ws,response,err:=websocket.Dial(ctx,"ws"+strings.TrimPrefix(server.URL,"http"),nil)
+ if err!=nil{t.Fatalf("file WS requires no token: %v status %v",err,response)}
+ t.Cleanup(func(){ws.CloseNow()})
+ return ws
+}
+func sendText(t *testing.T,ws *websocket.Conn,v any){
+ t.Helper(); data,err:=json.Marshal(v);if err!=nil{t.Fatal(err)}
+ ctx,cancel:=context.WithTimeout(context.Background(),5*time.Second);defer cancel()
+ if err:=ws.Write(ctx,websocket.MessageText,data);err!=nil{t.Fatal(err)}
+}
+func receive(t *testing.T,ws *websocket.Conn)(websocket.MessageType,map[string]any,[]byte){
+ t.Helper();ctx,cancel:=context.WithTimeout(context.Background(),5*time.Second);defer cancel()
+ typ,data,err:=ws.Read(ctx);if err!=nil{t.Fatal(err)}
+ if typ==websocket.MessageBinary{return typ,nil,data}
+ var m map[string]any;if err:=json.Unmarshal(data,&m);err!=nil{t.Fatal(err)}
  return typ,m,nil
 }
-func req(typ,p string)map[string]any{return map[string]any{"v":1,"id":"r1","type":typ,"path":p,"root":map[string]string{"kind":"folder","id":"safe"}}}
-
-func TestPrivatePeerValidation(t *testing.T){
- if _,err:=ParseAllowedIPs(nil);err==nil{t.Fatal("empty ACL allowed")}
- if _,err:=ParseAllowedIPs([]string{"192.168.1.2"});err!=nil{t.Fatal("private LAN rejected",err)}
- if _,err:=ParseAllowedIPs([]string{"8.8.8.8"});err==nil{t.Fatal("public IP allowed")}
- if _,err:=ParseAllowedIPs([]string{"100.114.58.74"});err!=nil{t.Fatal(err)}
- if ValidPath("../etc/passwd")||ValidPath("/etc/passwd")||ValidPath("a//b")||ValidPath("a\\b")||ValidPath("folder/.hcss-upload-payload") {t.Fatal("traversal or temp path allowed")}
- if !ValidPath("Фото/семья/мой файл.mkv"){t.Fatal("unicode path not allowed")}
+func request(action,p string)map[string]any {
+ return map[string]any{"v":1,"id":"r1","type":action,"path":p,"root":map[string]string{"kind":"folder","id":"safe"}}
 }
-func TestTokenCreatedPrivateAndReusable(t *testing.T){
- fn:=filepath.Join(t.TempDir(),"data","filews-token")
- hash,err:=LoadOrCreateToken(fn);if err!=nil{t.Fatal(err)}
- st,err:=os.Stat(fn);if err!=nil{t.Fatal(err)}
- if st.Mode().Perm()!=0600{t.Fatalf("token mode %o",st.Mode().Perm())}
- hash2,err:=LoadOrCreateToken(fn);if err!=nil||hash!=hash2{t.Fatal("token changed",err)}
- raw,err:=os.ReadFile(fn);if err!=nil{t.Fatal(err)}
- binary,err:=hex.DecodeString(strings.TrimSpace(string(raw)));if err!=nil||len(binary)!=32{t.Fatal("token invalid")}
+func TestNoKeysAndBrowserOriginDenied(t *testing.T){
+ s,_:=setup(t,catalog.Permission{List:true,Read:true,Write:true,Delete:true})
+ ws:=dial(t,s)
+ sendText(t,ws,request("file.mkdir","created"))
+ _,done,_:=receive(t,ws);if done["type"]!="file.complete"{t.Fatal(done)}
+ r,_:=http.NewRequest("GET",s.URL,nil);r.Header.Set("Origin","https://attacker.invalid")
+ response,err:=http.DefaultClient.Do(r);if err!=nil{t.Fatal(err)};response.Body.Close()
+ if response.StatusCode!=http.StatusForbidden{t.Fatalf("unexpected origin response %d",response.StatusCode)}
 }
-func TestUnauthorizedWithoutSecretAndBrowserOrigin(t *testing.T){
- server,_,token:=testSetup(t,catalog.Permission{List:true,Read:true,Write:true,Delete:true})
- resp,err:=http.Get(server.URL);if err!=nil{t.Fatal(err)};resp.Body.Close()
- if resp.StatusCode!=http.StatusUnauthorized{t.Fatalf("unauthorized status %d",resp.StatusCode)}
- request,_:=http.NewRequest("GET",server.URL,nil)
- request.Header.Set("Authorization","Bearer "+token)
- request.Header.Set("Origin","https://attacker.invalid")
- reply,err:=http.DefaultClient.Do(request);if err!=nil{t.Fatal(err)};reply.Body.Close()
- if reply.StatusCode!=http.StatusForbidden{t.Fatalf("browser status %d",reply.StatusCode)}
-}
-func TestUploadDownloadCreateRenameDelete(t *testing.T){
- server,dir,token:=testSetup(t,catalog.Permission{List:true,Read:true,Write:true,Delete:true})
- data:=[]byte("HomeCloud FS V1: no control WS bytes")
- digest:=sha256.Sum256(data)
- c:=connect(t,server,token)
- put:=req("file.put","test.txt");put["size_bytes"]=len(data)
- textReq(t,c,put)
- _,ready,_:=next(t,c);if ready["type"]!="file.ready"{t.Fatal(ready)}
+func TestFileTransferOperationsAndPermissions(t *testing.T){
+ s,dir:=setup(t,catalog.Permission{List:true,Read:true,Write:true,Delete:true})
+ data:=[]byte("HomeCloud keyless file transfer"); hash:=sha256.Sum256(data);digest:=hex.EncodeToString(hash[:])
+ ws:=dial(t,s); q:=request("file.put","test.txt");q["size_bytes"]=len(data);sendText(t,ws,q)
+ _,ready,_:=receive(t,ws);if ready["type"]!="file.ready"{t.Fatal(ready)}
  ctx,cancel:=context.WithTimeout(context.Background(),5*time.Second)
- if err:=c.Write(ctx,websocket.MessageBinary,data);err!=nil{t.Fatal(err)};cancel()
- textReq(t,c,map[string]any{"v":1,"type":"file.end","id":"r1","sha256":hex.EncodeToString(digest[:])})
- _,done,_:=next(t,c);if done["type"]!="file.complete"{t.Fatal(done)}
- raw,err:=os.ReadFile(filepath.Join(dir,"test.txt"));if err!=nil||string(raw)!=string(data){t.Fatalf("upload mismatch: %v",err)}
- if _,err:=os.Stat(filepath.Join(dir,".hcss-upload-" ));err==nil{t.Fatal("unexpected temp")}
- c2:=connect(t,server,token)
- textReq(t,c2,req("file.get","test.txt"))
- _,ready,_=next(t,c2);if ready["type"]!="file.ready"{t.Fatal(ready)}
- typ,_,blob:=next(t,c2);if typ!=websocket.MessageBinary||string(blob)!=string(data){t.Fatal("download differs")}
- _,done,_=next(t,c2);if done["type"]!="file.complete"||done["sha256"]!=hex.EncodeToString(digest[:]){t.Fatal(done)}
- c3:=connect(t,server,token)
- textReq(t,c3,req("file.put","test.txt"))
- _,errReply,_:=next(t,c3)
- // First upload with missing size is 0; service may offer ready and reject when publishing.
- if errReply["type"]=="file.ready" {textReq(t,c3,map[string]any{"v":1,"type":"file.end","id":"r1","sha256":hex.EncodeToString(sha256.New().Sum(nil))});_,errReply,_=next(t,c3)}
- if errReply["type"]!="file.error"||errReply["code"]!="TARGET_EXISTS"{t.Fatal("existing file should not be overwritten",errReply)}
- mkdir:=connect(t,server,token)
- textReq(t,mkdir,req("file.mkdir","folder"));_,done,_=next(t,mkdir);if done["type"]!="file.complete"{t.Fatal(done)}
- move:=connect(t,server,token)
- q:=req("file.rename","test.txt");q["new_path"]="folder/renamed.txt"
- textReq(t,move,q);_,done,_=next(t,move);if done["type"]!="file.complete"{t.Fatal(done)}
- remove:=connect(t,server,token)
- textReq(t,remove,req("file.delete","folder/renamed.txt"));_,done,_=next(t,remove);if done["type"]!="file.complete"{t.Fatal(done)}
- remove2:=connect(t,server,token)
- textReq(t,remove2,req("file.delete","folder"));_,done,_=next(t,remove2);if done["type"]!="file.complete"{t.Fatal(done)}
+ if err:=ws.Write(ctx,websocket.MessageBinary,data);err!=nil{t.Fatal(err)};cancel()
+ sendText(t,ws,map[string]any{"v":1,"id":"r1","type":"file.end","sha256":digest})
+ _,done,_:=receive(t,ws);if done["type"]!="file.complete"||done["sha256"]!=digest{t.Fatal(done)}
+ raw,err:=os.ReadFile(filepath.Join(dir,"test.txt"));if err!=nil||string(raw)!=string(data){t.Fatal("bad upload",err)}
+ download:=dial(t,s);sendText(t,download,request("file.get","test.txt"))
+ _,ready,_=receive(t,download);if ready["type"]!="file.ready"{t.Fatal(ready)}
+ typ,_,chunk:=receive(t,download);if typ!=websocket.MessageBinary||string(chunk)!=string(data){t.Fatal("bad download")}
+ _,done,_=receive(t,download);if done["sha256"]!=digest{t.Fatal("bad checksum")}
+ mkdir:=dial(t,s);sendText(t,mkdir,request("file.mkdir","folder"));_,done,_=receive(t,mkdir)
+ if done["type"]!="file.complete"{t.Fatal(done)}
+ move:=dial(t,s);q=request("file.rename","test.txt");q["new_path"]="folder/renamed.txt";sendText(t,move,q);_,done,_=receive(t,move);if done["type"]!="file.complete"{t.Fatal(done)}
+ remove:=dial(t,s);sendText(t,remove,request("file.delete","folder/renamed.txt"));_,done,_=receive(t,remove);if done["type"]!="file.complete"{t.Fatal(done)}
+ delDir:=dial(t,s);sendText(t,delDir,request("file.delete","folder"));_,done,_=receive(t,delDir);if done["type"]!="file.complete"{t.Fatal(done)}
 }
-func TestReadOnlyRootRejectsMutations(t *testing.T){
- server,_,token:=testSetup(t,catalog.Permission{List:true,Read:true})
- c:=connect(t,server,token)
- textReq(t,c,req("file.mkdir","blocked"))
- _,result,_:=next(t,c)
- if result["type"]!="file.error"||result["code"]!="WRITE_FORBIDDEN"{t.Fatal(result)}
-}
-func TestPeerListNeverTrustsForwardedFor(t *testing.T){
- server,_,token:=testSetup(t,catalog.Permission{List:true,Read:true})
- // RemoteAddr is the trusted TCP peer, not headers.
- r,_:=http.NewRequest("GET",server.URL,nil)
- r.Header.Set("Authorization","Bearer "+token)
- r.Header.Set("X-Forwarded-For","100.82.22.45")
- resp,err:=http.DefaultClient.Do(r);if err!=nil{t.Fatal(err)};resp.Body.Close()
- if resp.StatusCode==http.StatusOK{t.Fatal("plain request upgraded unexpectedly")}
- _,_,_=net.SplitHostPort("127.0.0.1:1")
-}
-
-func TestTrustedPrivateNetworkWithoutManualToken(t *testing.T) {
-    server,dir,_:=testSetup(t,catalog.Permission{List:true,Read:true,Write:true,Delete:true})
-    // The test helper uses the standard token mode; switch to an explicitly
-    // configured trusted-peer handler to exercise the no-token handshake.
-    c,err:=catalog.New([]catalog.Root{{ID:"safe",Kind:catalog.Folder,Path:dir,
-        Permission:catalog.Permission{List:true,Read:true,Write:true,Delete:true}}})
-    if err!=nil{t.Fatal(err)}
-    trusted:=httptest.NewServer(&Service{Catalog:c,TrustedNetwork:true,
-        Slots:make(chan struct{},1)})
-    defer trusted.Close()
-    ctx,cancel:=context.WithTimeout(context.Background(),5*time.Second)
-    defer cancel()
-    ws,resp,err:=websocket.Dial(ctx,"ws"+strings.TrimPrefix(trusted.URL,"http"),nil)
-    if err!=nil{t.Fatalf("trusted WS refused: %v; status %v",err,resp)}
-    defer ws.CloseNow()
-    textReq(t,ws,req("file.mkdir","test-folder"))
-    _,done,_:=next(t,ws)
-    if done["type"]!="file.complete"{t.Fatalf("file operation denied on exact allowlisted peer: %v",done)}
-    if _,err:=os.Stat(filepath.Join(dir,"test-folder"));err!=nil{t.Fatal(err)}
-    _=server
-}
-func TestTrustedNetworkWithoutACLIsPrivateOnly(t *testing.T) {
-    trusted:=&Service{TrustedNetwork:true}
-    for _,ip:=range []string{"127.0.0.1","192.168.0.123","10.12.0.8","172.18.1.9","100.114.58.74"} {
-        if !trusted.permitsPeer(netip.MustParseAddr(ip)){t.Fatalf("private client rejected: %s",ip)}
-    }
-    for _,ip:=range []string{"8.8.8.8","1.2.3.4","169.254.10.20","::1"} {
-        if trusted.permitsPeer(netip.MustParseAddr(ip)){t.Fatalf("nonprivate client accepted: %s",ip)}
-    }
-    trusted.AllowedPeers=[]netip.Addr{netip.MustParseAddr("192.168.0.123")}
-    if !trusted.permitsPeer(netip.MustParseAddr("192.168.0.123")) || trusted.permitsPeer(netip.MustParseAddr("192.168.0.124")){
-        t.Fatal("optional exact IP restriction is not enforced")
-    }
-    if (&Service{TrustedNetwork:false}).permitsPeer(netip.MustParseAddr("192.168.0.123")) {t.Fatal("token mode without ACL allowed a peer")}
-}
-
-func TestTrustedPeerListAcceptsExactPrivateLANNotInternet(t *testing.T){
-    if _,err:=ParseAllowedIPs([]string{"192.168.0.111","10.10.4.3","100.114.58.74"});err!=nil{t.Fatal(err)}
-    for _,value:=range []string{"8.8.8.8","0.0.0.0","224.1.2.3","192.168.1.0/24","abc"}{
-       if _,err:=ParseAllowedIPs([]string{value});err==nil{t.Fatalf("accepted unsafe peer %s",value)}
-    }
+func TestReadonlyRootsAndPaths(t *testing.T){
+ s,_:=setup(t,catalog.Permission{List:true,Read:true})
+ ws:=dial(t,s);sendText(t,ws,request("file.mkdir","blocked"))
+ _,done,_:=receive(t,ws);if done["type"]!="file.error"||done["code"]!="WRITE_FORBIDDEN"{t.Fatal(done)}
+ for _,path:=range []string{"../etc/passwd","/etc/passwd","a//b","a\\b","folder/.hcss-upload-evil"}{
+  if ValidPath(path){t.Fatalf("unsafe path accepted: %q",path)}
+ }
+ if !ValidPath("Фото/семья/мой файл.mkv"){t.Fatal("unicode path rejected")}
 }

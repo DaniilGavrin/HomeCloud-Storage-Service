@@ -1,5 +1,7 @@
-// Package filews provides an opt-in, authenticated, root-confined FILE DATA plane.
-// It is not mounted on Backend's unauthenticated control WebSocket.
+// Package filews provides an opt-in, root-confined FILE DATA plane.
+// Trusted-network mode requires an exact client-IP ACL and a private bind;
+// token mode remains supported for administrators who need both checks.
+// No file bytes or destructive operations use Backend's control WebSocket.
 package filews
 
 import (
@@ -31,6 +33,7 @@ type Service struct {
  Catalog *catalog.Catalog
  TokenSHA256 [32]byte
  AllowedPeers []netip.Addr
+ TrustedNetwork bool
  MaxUpload int64
  Slots chan struct{}
 }
@@ -101,10 +104,12 @@ func (s *Service) ServeHTTP(w http.ResponseWriter,r *http.Request){
  authorizedPeer:=false
  for _,p:=range s.AllowedPeers {if p.Unmap()==peer.Unmap(){authorizedPeer=true;break}}
  if !authorizedPeer || r.Header.Get("Origin")!="" {http.Error(w,"forbidden",http.StatusForbidden);return}
- secret:=strings.TrimPrefix(r.Header.Get("Authorization"),"Bearer ")
- hash:=sha256.Sum256([]byte(secret))
- if len(secret)!=64||subtle.ConstantTimeCompare(hash[:],s.TokenSHA256[:])!=1 {
-  http.Error(w,"unauthorized",http.StatusUnauthorized);return
+ if !s.TrustedNetwork {
+  secret:=strings.TrimPrefix(r.Header.Get("Authorization"),"Bearer ")
+  hash:=sha256.Sum256([]byte(secret))
+  if len(secret)!=64||subtle.ConstantTimeCompare(hash[:],s.TokenSHA256[:])!=1 {
+   http.Error(w,"unauthorized",http.StatusUnauthorized);return
+  }
  }
  if s.Slots!=nil {select{case s.Slots<-struct{}{}:defer func(){<-s.Slots}();default:http.Error(w,"busy",http.StatusTooManyRequests);return}}
  conn,err:=websocket.Accept(w,r,&websocket.AcceptOptions{InsecureSkipVerify:true})
@@ -259,7 +264,7 @@ func ParseAllowedIPs(raw []string)([]netip.Addr,error){
  tailnet:=netip.MustParsePrefix("100.64.0.0/10")
  for _,s:=range raw {
   ip,err:=netip.ParseAddr(s)
-  if err!=nil||!ip.Is4()||!(tailnet.Contains(ip)||ip.IsLoopback()){return nil,fmt.Errorf("FILE_WS_INVALID_CLIENT_IP: %q",s)}
+  if err!=nil||!ip.Is4()||!(tailnet.Contains(ip)||ip.IsPrivate()||ip.IsLoopback()){return nil,fmt.Errorf("FILE_WS_INVALID_CLIENT_IP: %q",s)}
   peers=append(peers,ip)
  }
  return peers,nil

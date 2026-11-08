@@ -7,3 +7,24 @@
 .DS_Store
 config.local.json
 .env
+
+# Runtime node configuration and persistent state (never commit real roots or IDs)
+config.json
+config.local.json
+config.*.local.json
+/data/
+
+# Private identity, transport credentials and temporary files
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+*.bak
+*.backup
